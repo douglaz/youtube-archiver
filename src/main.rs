@@ -520,14 +520,13 @@ async fn ingest(args: IngestArgs) -> Result<()> {
         bail!("yt-dlp did not return any video IDs for {}", args.url);
     }
 
+    ensure_resolved_videos(&ledger, &video_ids)?;
+
     let mut succeeded = 0usize;
     let mut failed = 0usize;
     let mut failed_video_ids = Vec::new();
 
     for video_id in video_ids {
-        let url = canonical_video_url(&video_id);
-        ledger.ensure_video(&video_id, &url)?;
-
         match process_video(&args, &ledger, &video_id).await {
             Ok(()) => {
                 succeeded += 1;
@@ -550,6 +549,13 @@ async fn ingest(args: IngestArgs) -> Result<()> {
         );
     }
 
+    Ok(())
+}
+
+fn ensure_resolved_videos(ledger: &Ledger, video_ids: &[String]) -> Result<()> {
+    for video_id in video_ids {
+        ledger.ensure_video(video_id, &canonical_video_url(video_id))?;
+    }
     Ok(())
 }
 
@@ -2165,6 +2171,24 @@ mod tests {
             collect_valid_resolved_video_ids("../escape\ndQw4w9WgXcQ\nabc1234567_\n", Some(1));
 
         assert_eq!(ids, ["dQw4w9WgXcQ"]);
+    }
+
+    #[test]
+    fn ensure_resolved_videos_inserts_all_rows() -> Result<()> {
+        let ledger = Ledger::open_in_memory()?;
+        let video_ids = vec!["dQw4w9WgXcQ".to_owned(), "abc1234567_".to_owned()];
+
+        ensure_resolved_videos(&ledger, &video_ids)?;
+
+        let rows = ledger.rows()?;
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.downloaded_at.is_none()));
+        assert!(rows.iter().all(|row| row.transcribed_at.is_none()));
+        assert!(rows.iter().all(|row| row.wiki_emitted_at.is_none()));
+        assert!(rows.iter().all(|row| row.error.is_none()));
+        assert_eq!(rows[0].video_id, "abc1234567_");
+        assert_eq!(rows[1].video_id, "dQw4w9WgXcQ");
+        Ok(())
     }
 
     #[test]
