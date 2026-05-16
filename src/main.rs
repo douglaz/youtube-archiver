@@ -482,6 +482,7 @@ async fn ingest(args: IngestArgs) -> Result<()> {
 
     let mut succeeded = 0usize;
     let mut failed = 0usize;
+    let mut failed_video_ids = Vec::new();
 
     for video_id in video_ids {
         let url = canonical_video_url(&video_id);
@@ -495,6 +496,7 @@ async fn ingest(args: IngestArgs) -> Result<()> {
             }
             Err(err) => {
                 failed += 1;
+                failed_video_ids.push(video_id.clone());
                 let message = format!("{err:#}");
                 error!(%video_id, error = %message, "video failed");
                 ledger.mark_error(&video_id, &message)?;
@@ -503,7 +505,10 @@ async fn ingest(args: IngestArgs) -> Result<()> {
     }
 
     if succeeded == 0 {
-        bail!("every video failed ({failed} failure(s))");
+        bail!(
+            "every video failed ({failed} failure(s)): {}",
+            failed_video_ids.join(", ")
+        );
     }
 
     Ok(())
