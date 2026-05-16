@@ -392,6 +392,16 @@ impl Ledger {
         Ok(())
     }
 
+    fn clear_error(&self, video_id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE videos SET error = NULL WHERE video_id = ?1",
+                params![video_id],
+            )
+            .with_context(|| format!("clear error for {video_id}"))?;
+        Ok(())
+    }
+
     fn row(&self, video_id: &str) -> Result<Option<VideoRow>> {
         self.conn
             .query_row(
@@ -543,6 +553,7 @@ async fn process_video(args: &IngestArgs, ledger: &Ledger, video_id: &str) -> Re
         .await
         .with_context(|| format!("emit wiki markdown for {video_id}"))?;
 
+    ledger.clear_error(video_id)?;
     Ok(())
 }
 
@@ -2189,6 +2200,61 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].video_id, "good");
         assert_eq!(rows[0].tags, vec!["rust".to_owned()]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn process_video_clears_stale_error_after_all_stages_skip() -> Result<()> {
+        let dir = tempdir()?;
+        let ledger = Ledger::open(dir.path())?;
+        let video_id = "dQw4w9WgXcQ";
+        let media_dir = dir.path().join("media").join(video_id);
+        let transcript_dir = dir.path().join("transcripts").join(video_id);
+        let wiki_path = dir
+            .path()
+            .join("wiki")
+            .join("rust-channel")
+            .join(format!("{video_id}.md"));
+        let info_path = media_dir.join("info.json");
+        let audio_path = media_dir.join("audio.m4a");
+        let transcript_json = transcript_dir.join("transcript.json");
+        let transcript_txt = transcript_dir.join("transcript.txt");
+
+        write_test_file(
+            &info_path,
+            br#"{
+                "id": "dQw4w9WgXcQ",
+                "webpage_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                "channel": "Rust Channel",
+                "title": "Skipped Success"
+            }"#,
+        )?;
+        write_test_file(&audio_path, b"audio")?;
+        write_test_file(&transcript_json, b"{}")?;
+        write_test_file(&transcript_txt, b"transcript")?;
+        write_test_file(&wiki_path, b"wiki")?;
+
+        ledger.ensure_video(video_id, &canonical_video_url(video_id))?;
+        ledger.mark_downloaded(video_id, &audio_path)?;
+        ledger.mark_transcribed(video_id, "large", &transcript_json)?;
+        ledger.mark_wiki_emitted(video_id, &wiki_path)?;
+        ledger.mark_error(video_id, "stale failure")?;
+
+        let args = IngestArgs {
+            url: canonical_video_url(video_id),
+            data_dir: dir.path().to_path_buf(),
+            whisper_model: "large".to_owned(),
+            whisper_bin: DEFAULT_WHISPER_BIN.to_owned(),
+            whisper_args: Vec::new(),
+            limit: None,
+            audio_format: "m4a".to_owned(),
+            force: false,
+        };
+
+        process_video(&args, &ledger, video_id).await?;
+
+        let row = ledger.row(video_id)?.expect("row exists");
+        assert!(row.error.is_none());
         Ok(())
     }
 
