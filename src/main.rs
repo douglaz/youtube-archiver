@@ -894,14 +894,30 @@ fn list_rows(data_dir: &Path) -> Result<Vec<VideoRow>> {
         .map(|ledger| ledger.rows())
         .transpose()?
         .unwrap_or_default();
-    Ok(rows.into_iter().filter(is_archived_row).collect::<Vec<_>>())
+    Ok(rows
+        .into_iter()
+        .filter(|row| is_archived_row(data_dir, row))
+        .collect::<Vec<_>>())
 }
 
-fn is_archived_row(row: &VideoRow) -> bool {
+fn is_archived_row(data_dir: &Path, row: &VideoRow) -> bool {
     row.downloaded_at.is_some()
         && row.transcribed_at.is_some()
         && row.wiki_emitted_at.is_some()
         && row.error.is_none()
+        && row.audio_path.as_deref().is_some_and(|path| {
+            let path = ledger_path_to_fs_path(data_dir, path);
+            path.is_file()
+        })
+        && row.transcript_path.as_deref().is_some_and(|path| {
+            let json_path = ledger_path_to_fs_path(data_dir, path);
+            let txt_path = json_path.with_file_name("transcript.txt");
+            json_path.is_file() && txt_path.is_file()
+        })
+        && row.wiki_path.as_deref().is_some_and(|path| {
+            let path = ledger_path_to_fs_path(data_dir, path);
+            path.is_file()
+        })
 }
 
 fn row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<VideoRow> {
@@ -1885,6 +1901,14 @@ mod tests {
         }
     }
 
+    fn write_test_file(path: &Path, bytes: &[u8]) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, bytes)?;
+        Ok(())
+    }
+
     #[test]
     fn classifies_video_channel_and_playlist_urls() {
         assert_eq!(
@@ -2368,15 +2392,20 @@ mod tests {
         let ledger = Ledger::open(dir.path())?;
         let complete_id = "dQw4w9WgXcQ";
         let failed_id = "abc1234567_";
+        let complete_audio = dir.path().join("media/dQw4w9WgXcQ/audio.m4a");
+        let complete_transcript_json = dir.path().join("transcripts/dQw4w9WgXcQ/transcript.json");
+        let complete_transcript_txt = dir.path().join("transcripts/dQw4w9WgXcQ/transcript.txt");
+        let complete_wiki = dir.path().join("wiki/channel/dQw4w9WgXcQ.md");
+
+        write_test_file(&complete_audio, b"audio")?;
+        write_test_file(&complete_transcript_json, b"{}")?;
+        write_test_file(&complete_transcript_txt, b"transcript")?;
+        write_test_file(&complete_wiki, b"wiki")?;
 
         ledger.ensure_video(complete_id, &canonical_video_url(complete_id))?;
-        ledger.mark_downloaded(complete_id, &dir.path().join("media/dQw4w9WgXcQ/audio.m4a"))?;
-        ledger.mark_transcribed(
-            complete_id,
-            "large",
-            &dir.path().join("transcripts/dQw4w9WgXcQ/transcript.json"),
-        )?;
-        ledger.mark_wiki_emitted(complete_id, &dir.path().join("wiki/channel/dQw4w9WgXcQ.md"))?;
+        ledger.mark_downloaded(complete_id, &complete_audio)?;
+        ledger.mark_transcribed(complete_id, "large", &complete_transcript_json)?;
+        ledger.mark_wiki_emitted(complete_id, &complete_wiki)?;
         ledger.ensure_video(failed_id, &canonical_video_url(failed_id))?;
         ledger.mark_error(failed_id, "download failed")?;
         drop(ledger);
@@ -2385,6 +2414,31 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].video_id, complete_id);
+        Ok(())
+    }
+
+    #[test]
+    fn list_rows_require_archived_artifacts_to_exist() -> Result<()> {
+        let dir = tempdir()?;
+        let ledger = Ledger::open(dir.path())?;
+        let video_id = "dQw4w9WgXcQ";
+        let audio = dir.path().join("media/dQw4w9WgXcQ/audio.m4a");
+        let transcript_json = dir.path().join("transcripts/dQw4w9WgXcQ/transcript.json");
+        let wiki = dir.path().join("wiki/channel/dQw4w9WgXcQ.md");
+
+        write_test_file(&audio, b"audio")?;
+        write_test_file(&transcript_json, b"{}")?;
+        write_test_file(&wiki, b"wiki")?;
+
+        ledger.ensure_video(video_id, &canonical_video_url(video_id))?;
+        ledger.mark_downloaded(video_id, &audio)?;
+        ledger.mark_transcribed(video_id, "large", &transcript_json)?;
+        ledger.mark_wiki_emitted(video_id, &wiki)?;
+        drop(ledger);
+
+        let rows = list_rows(dir.path())?;
+
+        assert!(rows.is_empty());
         Ok(())
     }
 
