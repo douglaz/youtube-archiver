@@ -15,12 +15,8 @@ use regex::Regex;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::{
-    fs,
-    io::{AsyncReadExt, AsyncWriteExt},
-    process::Command,
-};
-use tracing::{error, info};
+use tokio::{fs, io::AsyncWriteExt, process::Command};
+use tracing::{error, info, warn};
 
 const DEFAULT_DATA_DIR: &str = "data";
 const DEFAULT_WHISPER_BIN: &str = "nix run nixpkgs#openai-whisper --";
@@ -29,7 +25,7 @@ const DEFAULT_AUDIO_FORMAT: &str = "m4a";
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static SLUG_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new("[^a-z0-9]+").expect("slug regex compiles"));
+    LazyLock::new(|| Regex::new(r"[^\p{Alphabetic}\p{Number}]+").expect("slug regex compiles"));
 
 #[derive(Parser, Debug)]
 #[command(name = "youtube-archiver")]
@@ -73,7 +69,7 @@ struct IngestArgs {
     )]
     whisper_args: Vec<String>,
 
-    #[arg(long)]
+    #[arg(long, value_parser = parse_positive_usize)]
     limit: Option<usize>,
 
     #[arg(long, default_value = DEFAULT_AUDIO_FORMAT)]
@@ -87,6 +83,17 @@ struct IngestArgs {
 struct DataDirArgs {
     #[arg(long, default_value = DEFAULT_DATA_DIR)]
     data_dir: PathBuf,
+}
+
+fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|err| format!("invalid positive integer: {err}"))?;
+    if parsed == 0 {
+        Err("value must be greater than 0".to_owned())
+    } else {
+        Ok(parsed)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -328,13 +335,27 @@ impl Ledger {
                     whisper_model = ?2,
                     transcript_path = ?3,
                     wiki_emitted_at = NULL,
-                    wiki_path = NULL,
                     error = NULL
                 WHERE video_id = ?1
                 "#,
                 params![video_id, whisper_model, transcript_path],
             )
             .with_context(|| format!("mark {video_id} transcribed"))?;
+        Ok(())
+    }
+
+    fn mark_transcription_started(&self, video_id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                r#"
+                UPDATE videos
+                SET transcribed_at = NULL,
+                    wiki_emitted_at = NULL
+                WHERE video_id = ?1
+                "#,
+                params![video_id],
+            )
+            .with_context(|| format!("mark {video_id} transcription started"))?;
         Ok(())
     }
 
@@ -432,7 +453,7 @@ async fn ingest(args: IngestArgs) -> Result<()> {
     let ledger = Ledger::open(&args.data_dir)?;
     let mode = classify_youtube_url(&args.url);
     info!(?mode, url = %args.url, "resolving input URL");
-    let video_ids = resolve_video_ids(&args.url, args.limit).await?;
+    let video_ids = resolve_video_ids(&args.url, mode, args.limit).await?;
 
     if video_ids.is_empty() {
         bail!("yt-dlp did not return any video IDs for {}", args.url);
@@ -502,8 +523,12 @@ async fn process_video(args: &IngestArgs, ledger: &Ledger, video_id: &str) -> Re
     Ok(())
 }
 
-async fn resolve_video_ids(url: &str, limit: Option<usize>) -> Result<Vec<String>> {
-    let args = resolve_video_ids_args(url, limit);
+async fn resolve_video_ids(
+    url: &str,
+    mode: InputMode,
+    limit: Option<usize>,
+) -> Result<Vec<String>> {
+    let args = resolve_video_ids_args(url, mode, limit);
     let output = run_checked("yt-dlp", &args).await?;
     let stdout = String::from_utf8(output.stdout).context("yt-dlp emitted non-UTF8 video IDs")?;
     let mut seen = HashSet::new();
@@ -525,12 +550,15 @@ async fn resolve_video_ids(url: &str, limit: Option<usize>) -> Result<Vec<String
     Ok(ids)
 }
 
-fn resolve_video_ids_args(url: &str, limit: Option<usize>) -> Vec<String> {
+fn resolve_video_ids_args(url: &str, mode: InputMode, limit: Option<usize>) -> Vec<String> {
     let mut args = vec![
         "--flat-playlist".to_owned(),
         "--print".to_owned(),
         "id".to_owned(),
     ];
+    if mode == InputMode::Video {
+        args.push("--no-playlist".to_owned());
+    }
     if let Some(limit) = limit {
         args.extend(["--playlist-end".to_owned(), limit.to_string()]);
     }
@@ -632,7 +660,9 @@ async fn download_audio(
     let cleanup = fs::remove_dir_all(&tmp_dir).await;
     let final_path = match result {
         Ok(final_path) => {
-            cleanup.with_context(|| format!("remove {}", tmp_dir.display()))?;
+            if let Err(err) = cleanup {
+                warn!(path = %tmp_dir.display(), error = %err, "failed to remove temporary download dir");
+            }
             final_path
         }
         Err(err) => {
@@ -696,6 +726,7 @@ async fn transcribe_audio(
         let whisper_txt = find_whisper_output(&tmp_dir, "txt", output_stem).await?;
         let final_json = transcript_dir.join("transcript.json");
         let final_txt = transcript_dir.join("transcript.txt");
+        ledger.mark_transcription_started(video_id)?;
         replace_transcript_pair(&whisper_json, &whisper_txt, &final_json, &final_txt).await?;
         Ok(final_json)
     }
@@ -704,7 +735,9 @@ async fn transcribe_audio(
     let cleanup = fs::remove_dir_all(&tmp_dir).await;
     let final_json = match result {
         Ok(final_json) => {
-            cleanup.with_context(|| format!("remove {}", tmp_dir.display()))?;
+            if let Err(err) = cleanup {
+                warn!(path = %tmp_dir.display(), error = %err, "failed to remove temporary whisper dir");
+            }
             final_json
         }
         Err(err) => {
@@ -723,13 +756,16 @@ async fn emit_wiki_article(
     metadata: &VideoMetadata,
     force: bool,
 ) -> Result<PathBuf> {
-    if let Some(row) = ledger.row(&metadata.video_id)?
-        && should_skip_wiki_async(&row, force).await
-    {
-        return Ok(PathBuf::from(
-            row.wiki_path.expect("checked by should_skip_wiki_async"),
-        ));
-    }
+    let previous_wiki_path = if let Some(row) = ledger.row(&metadata.video_id)? {
+        if should_skip_wiki_async(&row, force).await {
+            return Ok(PathBuf::from(
+                row.wiki_path.expect("checked by should_skip_wiki_async"),
+            ));
+        }
+        row.wiki_path
+    } else {
+        None
+    };
 
     let transcript_txt = data_dir
         .join("transcripts")
@@ -753,6 +789,7 @@ async fn emit_wiki_article(
         .join(format!("{}.md", metadata.video_id));
     let article = render_wiki_markdown(metadata, &transcript)?;
     atomic_write(&wiki_path, article.as_bytes()).await?;
+    remove_stale_wiki_article(previous_wiki_path.as_deref(), &wiki_path).await?;
     ledger.mark_wiki_emitted(&metadata.video_id, &wiki_path)?;
     Ok(wiki_path)
 }
@@ -797,6 +834,12 @@ fn list(args: DataDirArgs) -> Result<()> {
 fn row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<VideoRow> {
     let duration: Option<i64> = row.get(7)?;
     let tags_json: Option<String> = row.get(8)?;
+    let tags = match tags_json.as_deref() {
+        Some(value) => serde_json::from_str(value).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(err))
+        })?,
+        None => Vec::new(),
+    };
     Ok(VideoRow {
         video_id: row.get(0)?,
         url: row.get(1)?,
@@ -806,10 +849,7 @@ fn row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<VideoRow> {
         title: row.get(5)?,
         upload_date: row.get(6)?,
         duration: duration.and_then(|value| u64::try_from(value).ok()),
-        tags: tags_json
-            .as_deref()
-            .and_then(|value| serde_json::from_str(value).ok())
-            .unwrap_or_default(),
+        tags,
         downloaded_at: row.get(9)?,
         transcribed_at: row.get(10)?,
         wiki_emitted_at: row.get(11)?,
@@ -934,7 +974,7 @@ fn yaml_string(value: &str) -> Result<String> {
 }
 
 fn slugify(value: &str) -> String {
-    let lower = value.to_ascii_lowercase();
+    let lower = value.to_lowercase();
     let slug = SLUG_RE.replace_all(&lower, "-");
     let slug = slug.trim_matches('-');
 
@@ -1037,68 +1077,12 @@ fn transcript_state(row: &VideoRow) -> &'static str {
 }
 
 async fn run_checked(program: &str, args: &[String]) -> Result<Output> {
-    let mut child = Command::new(program)
+    let output = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .output()
+        .await
         .with_context(|| format!("run {}", format_command(program, args)))?;
-
-    let mut stdout = child.stdout.take().ok_or_else(|| {
-        anyhow!(
-            "failed to capture stdout for {}",
-            format_command(program, args)
-        )
-    })?;
-    let mut stderr = child.stderr.take().ok_or_else(|| {
-        anyhow!(
-            "failed to capture stderr for {}",
-            format_command(program, args)
-        )
-    })?;
-
-    let stdout_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        stdout.read_to_end(&mut buf).await?;
-        Ok::<Vec<u8>, std::io::Error>(buf)
-    });
-    let stderr_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 8192];
-        loop {
-            let read = stderr.read(&mut chunk).await?;
-            if read == 0 {
-                break;
-            }
-            let bytes = &chunk[..read];
-            {
-                let mut stream = std::io::stderr().lock();
-                let _ = std::io::Write::write_all(&mut stream, bytes);
-                let _ = std::io::Write::flush(&mut stream);
-            }
-            buf.extend_from_slice(bytes);
-        }
-        Ok::<Vec<u8>, std::io::Error>(buf)
-    });
-
-    let status = child
-        .wait()
-        .await
-        .with_context(|| format!("wait for {}", format_command(program, args)))?;
-    let stdout = stdout_task
-        .await
-        .context("join stdout reader")?
-        .context("read command stdout")?;
-    let stderr = stderr_task
-        .await
-        .context("join stderr reader")?
-        .context("read command stderr")?;
-    let output = Output {
-        status,
-        stdout,
-        stderr,
-    };
 
     if output.status.success() {
         Ok(output)
@@ -1116,86 +1100,11 @@ async fn run_checked(program: &str, args: &[String]) -> Result<Output> {
 }
 
 fn split_command_prefix(command: &str) -> Result<(String, Vec<String>)> {
-    let parts = shell_words(command)?;
+    let parts = shell_words::split(command).context("parse whisper command prefix")?;
     let (program, args) = parts
         .split_first()
         .ok_or_else(|| anyhow!("whisper command must not be empty"))?;
     Ok((program.to_owned(), args.to_vec()))
-}
-
-fn shell_words(command: &str) -> Result<Vec<String>> {
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Quote {
-        None,
-        Single,
-        Double,
-    }
-
-    let mut words = Vec::new();
-    let mut current = String::new();
-    let mut quote = Quote::None;
-    let mut in_word = false;
-    let mut chars = command.chars();
-
-    while let Some(ch) = chars.next() {
-        match quote {
-            Quote::None => match ch {
-                ch if ch.is_whitespace() => {
-                    if in_word {
-                        words.push(std::mem::take(&mut current));
-                        in_word = false;
-                    }
-                }
-                '\'' => {
-                    quote = Quote::Single;
-                    in_word = true;
-                }
-                '"' => {
-                    quote = Quote::Double;
-                    in_word = true;
-                }
-                '\\' => {
-                    let escaped = chars
-                        .next()
-                        .ok_or_else(|| anyhow!("trailing escape in command prefix"))?;
-                    current.push(escaped);
-                    in_word = true;
-                }
-                _ => {
-                    current.push(ch);
-                    in_word = true;
-                }
-            },
-            Quote::Single => {
-                if ch == '\'' {
-                    quote = Quote::None;
-                } else {
-                    current.push(ch);
-                }
-            }
-            Quote::Double => match ch {
-                '"' => quote = Quote::None,
-                '\\' => {
-                    let escaped = chars
-                        .next()
-                        .ok_or_else(|| anyhow!("trailing escape in command prefix"))?;
-                    current.push(escaped);
-                }
-                _ => current.push(ch),
-            },
-        }
-    }
-
-    match quote {
-        Quote::None => {
-            if in_word {
-                words.push(current);
-            }
-            Ok(words)
-        }
-        Quote::Single => bail!("unterminated single quote in command prefix"),
-        Quote::Double => bail!("unterminated double quote in command prefix"),
-    }
 }
 
 fn format_command(program: &str, args: &[String]) -> String {
@@ -1312,6 +1221,43 @@ async fn remove_stale_audio_files(media_dir: &Path, keep_path: &Path) -> Result<
     Ok(())
 }
 
+async fn remove_stale_wiki_article(previous_path: Option<&str>, current_path: &Path) -> Result<()> {
+    let Some(previous_path) = previous_path else {
+        return Ok(());
+    };
+    let previous_path = path_to_ledger_string(Path::new(previous_path))?;
+    let current_path = path_to_ledger_string(current_path)?;
+    if previous_path == current_path {
+        return Ok(());
+    }
+
+    let previous_path = PathBuf::from(previous_path);
+    match fs::metadata(&previous_path).await {
+        Ok(metadata) if metadata.is_file() => {
+            fs::remove_file(&previous_path).await.with_context(|| {
+                format!("remove stale wiki article {}", previous_path.display())
+            })?;
+            if let Some(parent) = previous_path.parent()
+                && let Err(err) = fs::remove_dir(parent).await
+                && err.kind() != std::io::ErrorKind::NotFound
+                && err.kind() != std::io::ErrorKind::DirectoryNotEmpty
+            {
+                warn!(path = %parent.display(), error = %err, "failed to remove empty wiki directory");
+            }
+        }
+        Ok(_) => {
+            warn!(path = %previous_path.display(), "stale wiki path is not a regular file");
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("stat stale wiki article {}", previous_path.display()));
+        }
+    }
+
+    Ok(())
+}
+
 async fn cleanup_stage_temp_dirs(parent: &Path, prefix: &str) -> Result<()> {
     let mut entries = fs::read_dir(parent)
         .await
@@ -1334,10 +1280,7 @@ async fn cleanup_stage_temp_dirs(parent: &Path, prefix: &str) -> Result<()> {
         let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if file_name.starts_with(&format!("{prefix}."))
-            && file_name.ends_with(".tmp")
-            && file_name.len() > prefix.len() + ".tmp".len()
-        {
+        if should_remove_stage_temp_dir(file_name, prefix) {
             fs::remove_dir_all(&path)
                 .await
                 .with_context(|| format!("remove stale temp dir {}", path.display()))?;
@@ -1345,6 +1288,40 @@ async fn cleanup_stage_temp_dirs(parent: &Path, prefix: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn should_remove_stage_temp_dir(file_name: &str, prefix: &str) -> bool {
+    let Some(pid) = stage_temp_dir_pid(file_name, prefix) else {
+        return false;
+    };
+    pid == std::process::id() || !process_exists(pid)
+}
+
+fn stage_temp_dir_pid(file_name: &str, prefix: &str) -> Option<u32> {
+    let rest = file_name.strip_prefix(prefix)?.strip_prefix('.')?;
+    let rest = rest.strip_suffix(".tmp")?;
+    let mut parts = rest.split('.');
+    let pid = parts.next()?.parse::<u32>().ok()?;
+    let mut has_timestamp = false;
+    for part in parts {
+        has_timestamp = true;
+        if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+    }
+    has_timestamp.then_some(pid)
+}
+
+fn process_exists(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        Path::new("/proc").join(pid.to_string()).exists()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        true
+    }
 }
 
 async fn find_whisper_output(
@@ -1468,11 +1445,7 @@ fn unique_temp_name(prefix: &str) -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_nanos());
-    format!(
-        "{prefix}.{}.{}.tmp",
-        std::process::id(),
-        nanos + u128::from(counter)
-    )
+    format!("{prefix}.{}.{}.{}.tmp", std::process::id(), nanos, counter)
 }
 
 fn path_to_string(path: &Path) -> String {
@@ -1552,7 +1525,11 @@ mod tests {
     #[test]
     fn resolve_video_ids_args_pass_limit_to_yt_dlp() {
         assert_eq!(
-            resolve_video_ids_args("https://www.youtube.com/playlist?list=PL123", Some(3)),
+            resolve_video_ids_args(
+                "https://www.youtube.com/playlist?list=PL123",
+                InputMode::Playlist,
+                Some(3)
+            ),
             [
                 "--flat-playlist",
                 "--print",
@@ -1565,11 +1542,46 @@ mod tests {
     }
 
     #[test]
+    fn resolve_video_ids_args_disable_playlists_for_video_urls() {
+        assert_eq!(
+            resolve_video_ids_args(
+                "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PL123",
+                InputMode::Video,
+                None
+            ),
+            [
+                "--flat-playlist",
+                "--print",
+                "id",
+                "--no-playlist",
+                "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PL123"
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_zero_limit() {
+        let result = Cli::try_parse_from([
+            "youtube-archiver",
+            "ingest",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "--limit",
+            "0",
+        ]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn slugifies_channel_titles() {
         assert_eq!(slugify("The Rust Channel"), "the-rust-channel");
         assert_eq!(
             slugify("  Rust: Fast, Safe & Productive!  "),
             "rust-fast-safe-productive"
+        );
+        assert_eq!(
+            slugify("\u{041a}\u{0430}\u{043d}\u{0430}\u{043b} Rust"),
+            "\u{043a}\u{0430}\u{043d}\u{0430}\u{043b}-rust"
         );
         assert_eq!(slugify("!!!"), "unknown-channel");
     }
@@ -1660,6 +1672,20 @@ mod tests {
     }
 
     #[test]
+    fn ledger_rejects_corrupt_tags_json() -> Result<()> {
+        let ledger = Ledger::open_in_memory()?;
+        ledger.conn.execute(
+            "INSERT INTO videos (video_id, url, tags) VALUES (?1, ?2, ?3)",
+            params!["abc123", canonical_video_url("abc123"), "not json"],
+        )?;
+
+        let err = ledger.row("abc123").expect_err("corrupt tags should fail");
+
+        assert!(format!("{err:#}").contains("expected ident"));
+        Ok(())
+    }
+
+    #[test]
     fn clear_error_removes_stale_ledger_error() -> Result<()> {
         let ledger = Ledger::open_in_memory()?;
         let video_id = "abc123";
@@ -1692,7 +1718,7 @@ mod tests {
     }
 
     #[test]
-    fn marking_transcribed_invalidates_existing_wiki_output() -> Result<()> {
+    fn marking_transcribed_invalidates_existing_wiki_timestamp_but_preserves_path() -> Result<()> {
         let ledger = Ledger::open_in_memory()?;
         let video_id = "abc123";
         ledger.ensure_video(video_id, &canonical_video_url(video_id))?;
@@ -1710,7 +1736,28 @@ mod tests {
         let row = ledger.row(video_id)?.expect("row exists");
 
         assert!(row.wiki_emitted_at.is_none());
-        assert!(row.wiki_path.is_none());
+        assert!(row.wiki_path.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn marking_transcription_started_invalidates_transcription_skip() -> Result<()> {
+        let dir = tempdir()?;
+        let ledger = Ledger::open_in_memory()?;
+        let video_id = "abc123";
+        let transcript_json = dir.path().join("transcript.json");
+        let transcript_txt = dir.path().join("transcript.txt");
+        std::fs::write(&transcript_json, b"{}")?;
+        std::fs::write(&transcript_txt, b"text")?;
+
+        ledger.ensure_video(video_id, &canonical_video_url(video_id))?;
+        ledger.mark_transcribed(video_id, "large", &transcript_json)?;
+        let row = ledger.row(video_id)?.expect("row exists");
+        assert!(should_skip_transcription(&row, "large", false));
+
+        ledger.mark_transcription_started(video_id)?;
+        let row = ledger.row(video_id)?.expect("row exists");
+        assert!(!should_skip_transcription(&row, "large", false));
         Ok(())
     }
 
@@ -1754,9 +1801,10 @@ mod tests {
     #[tokio::test]
     async fn cleanup_stage_temp_dirs_removes_previous_stage_dirs() -> Result<()> {
         let dir = tempdir()?;
-        let stale = dir.path().join(".download.123.tmp");
-        let unrelated_dir = dir.path().join(".whisper.123.tmp");
-        let ordinary_file = dir.path().join(".download.456.tmp");
+        let pid = std::process::id();
+        let stale = dir.path().join(format!(".download.{pid}.1.0.tmp"));
+        let unrelated_dir = dir.path().join(format!(".whisper.{pid}.1.0.tmp"));
+        let ordinary_file = dir.path().join(format!(".download.{pid}.2.0.tmp"));
         fs::create_dir(&stale).await?;
         fs::create_dir(&unrelated_dir).await?;
         fs::write(&ordinary_file, b"not a directory").await?;
@@ -1766,6 +1814,21 @@ mod tests {
         assert!(!fs::try_exists(&stale).await?);
         assert!(fs::try_exists(&unrelated_dir).await?);
         assert!(fs::try_exists(&ordinary_file).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_wiki_article_is_removed_when_target_changes() -> Result<()> {
+        let dir = tempdir()?;
+        let old_wiki = dir.path().join("wiki").join("old").join("abc123.md");
+        let new_wiki = dir.path().join("wiki").join("new").join("abc123.md");
+        atomic_write(&old_wiki, b"old").await?;
+        atomic_write(&new_wiki, b"new").await?;
+
+        remove_stale_wiki_article(Some(&path_to_string(&old_wiki)), &new_wiki).await?;
+
+        assert!(!fs::try_exists(&old_wiki).await?);
+        assert!(fs::try_exists(&new_wiki).await?);
         Ok(())
     }
 
