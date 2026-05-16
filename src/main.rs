@@ -450,6 +450,8 @@ async fn main() -> Result<()> {
 }
 
 async fn ingest(args: IngestArgs) -> Result<()> {
+    validate_whisper_args(&args.whisper_args)?;
+
     let ledger = Ledger::open(&args.data_dir)?;
     let mode = classify_youtube_url(&args.url);
     info!(?mode, url = %args.url, "resolving input URL");
@@ -1143,6 +1145,21 @@ fn split_command_prefix(command: &str) -> Result<(String, Vec<String>)> {
     Ok((program.to_owned(), args.to_vec()))
 }
 
+fn validate_whisper_args(args: &[String]) -> Result<()> {
+    for arg in args {
+        let option = arg.split_once('=').map_or(arg.as_str(), |(option, _)| option);
+        if matches!(
+            option,
+            "--output_dir" | "--output-dir" | "--output_format" | "--output-format"
+        ) {
+            bail!(
+                "--whisper-arg {option} is managed by youtube-archiver; use --data-dir for archive location"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn format_command(program: &str, args: &[String]) -> String {
     if args.is_empty() {
         program.to_owned()
@@ -1711,6 +1728,14 @@ mod tests {
         assert_eq!(program, "/tmp/bin/whisper tool");
         assert_eq!(args, ["--initial_prompt", "Alice Bob", "--flag"]);
         Ok(())
+    }
+
+    #[test]
+    fn rejects_whisper_output_args() {
+        let args = vec!["--output_dir=/tmp/elsewhere".to_owned()];
+        let err = validate_whisper_args(&args).expect_err("output dir should be rejected");
+
+        assert!(format!("{err:#}").contains("--output_dir"));
     }
 
     #[test]
