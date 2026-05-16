@@ -642,7 +642,7 @@ async fn download_audio(
     ];
 
     let result: Result<PathBuf> = async {
-        run_checked("yt-dlp", &args).await?;
+        run_checked_inherit_stderr("yt-dlp", &args).await?;
         let downloaded = find_audio_file(&tmp_dir, audio_format).await?;
         let extension = downloaded
             .extension()
@@ -718,7 +718,7 @@ async fn transcribe_audio(
 
     ledger.mark_transcription_started(video_id)?;
     let result: Result<PathBuf> = async {
-        run_checked(&program, &args).await?;
+        run_checked_inherit_stderr(&program, &args).await?;
         let output_stem = audio_path
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -1104,7 +1104,22 @@ async fn run_checked(program: &str, args: &[String]) -> Result<Output> {
         .output()
         .await
         .with_context(|| format!("run {}", format_command(program, args)))?;
+    ensure_success(program, args, output)
+}
 
+async fn run_checked_inherit_stderr(program: &str, args: &[String]) -> Result<Output> {
+    let output = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .output()
+        .await
+        .with_context(|| format!("run {}", format_command(program, args)))?;
+    ensure_success(program, args, output)
+}
+
+fn ensure_success(program: &str, args: &[String], output: Output) -> Result<Output> {
     if output.status.success() {
         Ok(output)
     } else {
