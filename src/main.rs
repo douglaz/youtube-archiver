@@ -537,7 +537,9 @@ async fn ingest(args: IngestArgs) -> Result<()> {
                 failed_video_ids.push(video_id.clone());
                 let message = format!("{err:#}");
                 error!(%video_id, error = %message, "video failed");
-                ledger.mark_error(&video_id, &message)?;
+                if let Err(err) = ledger.mark_error(&video_id, &message) {
+                    warn!(%video_id, error = %err, original_error = %message, "failed to record video error in ledger");
+                }
             }
         }
     }
