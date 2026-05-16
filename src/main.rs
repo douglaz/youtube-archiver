@@ -848,8 +848,8 @@ async fn transcribe_audio(
         let (whisper_json, whisper_txt) = find_whisper_outputs(&tmp_dir, output_stem).await?;
         let final_json = transcript_dir.join("transcript.json");
         let final_txt = transcript_dir.join("transcript.txt");
-        replace_transcript_pair(&whisper_json, &whisper_txt, &final_json, &final_txt).await?;
         ledger.mark_transcription_started(video_id)?;
+        replace_transcript_pair(&whisper_json, &whisper_txt, &final_json, &final_txt).await?;
         Ok(final_json)
     }
     .await;
@@ -2604,17 +2604,21 @@ mod tests {
         let video_id = "abc123";
         let transcript_json = dir.path().join("transcript.json");
         let transcript_txt = dir.path().join("transcript.txt");
+        let wiki = dir.path().join("wiki/channel/abc123.md");
         std::fs::write(&transcript_json, b"{}")?;
         std::fs::write(&transcript_txt, b"text")?;
 
         ledger.ensure_video(video_id, &canonical_video_url(video_id))?;
         ledger.mark_transcribed(video_id, "large", &transcript_json)?;
+        ledger.mark_wiki_emitted(video_id, &wiki)?;
         let row = ledger.row(video_id)?.expect("row exists");
         assert!(should_skip_transcription(dir.path(), &row, "large", false));
+        assert!(row.wiki_emitted_at.is_some());
 
         ledger.mark_transcription_started(video_id)?;
         let row = ledger.row(video_id)?.expect("row exists");
         assert!(!should_skip_transcription(dir.path(), &row, "large", false));
+        assert!(row.wiki_emitted_at.is_none());
         Ok(())
     }
 
