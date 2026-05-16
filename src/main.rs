@@ -15,13 +15,18 @@ use regex::Regex;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::{fs, io::AsyncWriteExt, process::Command};
+use tokio::{
+    fs,
+    io::{AsyncReadExt, AsyncWriteExt},
+    process::Command,
+};
 use tracing::{error, info, warn};
 
 const DEFAULT_DATA_DIR: &str = "data";
 const DEFAULT_WHISPER_BIN: &str = "nix run nixpkgs#openai-whisper --";
 const DEFAULT_WHISPER_MODEL: &str = "large";
 const DEFAULT_AUDIO_FORMAT: &str = "m4a";
+const STREAMED_STDERR_CAPTURE_LIMIT: usize = 64 * 1024;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static SLUG_RE: LazyLock<Regex> =
@@ -668,7 +673,7 @@ async fn download_audio(
     ];
 
     let result: Result<PathBuf> = async {
-        run_checked_inherit_stderr("yt-dlp", &args).await?;
+        run_checked_stream_stderr("yt-dlp", &args).await?;
         let downloaded = find_audio_file(&tmp_dir, audio_format).await?;
         let extension = downloaded
             .extension()
@@ -744,7 +749,7 @@ async fn transcribe_audio(
 
     ledger.mark_transcription_started(video_id)?;
     let result: Result<PathBuf> = async {
-        run_checked_inherit_stderr(&program, &args).await?;
+        run_checked_stream_stderr(&program, &args).await?;
         let output_stem = audio_path
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -1176,16 +1181,89 @@ async fn run_checked(program: &str, args: &[String]) -> Result<Output> {
     ensure_success(program, args, output)
 }
 
-async fn run_checked_inherit_stderr(program: &str, args: &[String]) -> Result<Output> {
-    let output = Command::new(program)
+async fn run_checked_stream_stderr(program: &str, args: &[String]) -> Result<Output> {
+    let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .output()
-        .await
+        .stderr(Stdio::piped())
+        .spawn()
         .with_context(|| format!("run {}", format_command(program, args)))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("capture stdout for {}", format_command(program, args)))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("capture stderr for {}", format_command(program, args)))?;
+
+    let stdout_task = tokio::spawn(async move {
+        let mut captured = Vec::new();
+        stdout.read_to_end(&mut captured).await?;
+        Ok::<Vec<u8>, std::io::Error>(captured)
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut captured = Vec::new();
+        let mut truncated = false;
+        let mut chunk = [0u8; 8192];
+        let mut live_stderr = std::io::stderr();
+
+        loop {
+            let read = stderr.read(&mut chunk).await?;
+            if read == 0 {
+                break;
+            }
+            std::io::Write::write_all(&mut live_stderr, &chunk[..read])?;
+            truncated |= push_captured_stderr(&mut captured, &chunk[..read]);
+        }
+        std::io::Write::flush(&mut live_stderr)?;
+
+        if truncated {
+            let mut prefixed =
+                format!("[stderr truncated to last {STREAMED_STDERR_CAPTURE_LIMIT} bytes]\n")
+                    .into_bytes();
+            prefixed.extend_from_slice(&captured);
+            captured = prefixed;
+        }
+
+        Ok::<Vec<u8>, std::io::Error>(captured)
+    });
+
+    let status = child
+        .wait()
+        .await
+        .with_context(|| format!("wait for {}", format_command(program, args)))?;
+    let stdout = stdout_task
+        .await
+        .context("join child stdout reader")?
+        .with_context(|| format!("read stdout from {}", format_command(program, args)))?;
+    let stderr = stderr_task
+        .await
+        .context("join child stderr reader")?
+        .with_context(|| format!("read stderr from {}", format_command(program, args)))?;
+
+    let output = Output {
+        status,
+        stdout,
+        stderr,
+    };
     ensure_success(program, args, output)
+}
+
+fn push_captured_stderr(captured: &mut Vec<u8>, chunk: &[u8]) -> bool {
+    let mut truncated = false;
+    if captured.len() + chunk.len() > STREAMED_STDERR_CAPTURE_LIMIT {
+        let excess = captured.len() + chunk.len() - STREAMED_STDERR_CAPTURE_LIMIT;
+        if excess >= captured.len() {
+            captured.clear();
+        } else {
+            captured.drain(..excess);
+        }
+        truncated = true;
+    }
+    captured.extend_from_slice(chunk);
+    truncated
 }
 
 fn ensure_success(program: &str, args: &[String], output: Output) -> Result<Output> {
