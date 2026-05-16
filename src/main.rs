@@ -132,6 +132,31 @@ struct WhisperConfig<'a> {
     extra_args: &'a [String],
 }
 
+struct AbortOnDrop<T> {
+    handle: Option<tokio::task::JoinHandle<T>>,
+}
+
+impl<T> AbortOnDrop<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    async fn join(mut self) -> std::result::Result<T, tokio::task::JoinError> {
+        let handle = self.handle.take().expect("join handle exists");
+        handle.await
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct VideoRow {
     video_id: String,
@@ -1282,12 +1307,12 @@ async fn run_checked_stream_stderr(program: &str, args: &[String]) -> Result<Out
         .take()
         .ok_or_else(|| anyhow!("capture stderr for {}", format_command(program, args)))?;
 
-    let stdout_task = tokio::spawn(async move {
+    let stdout_task = AbortOnDrop::new(tokio::spawn(async move {
         let mut captured = Vec::new();
         stdout.read_to_end(&mut captured).await?;
         Ok::<Vec<u8>, std::io::Error>(captured)
-    });
-    let stderr_task = tokio::spawn(async move {
+    }));
+    let stderr_task = AbortOnDrop::new(tokio::spawn(async move {
         let mut captured = Vec::new();
         let mut truncated = false;
         let mut chunk = [0u8; 8192];
@@ -1312,20 +1337,22 @@ async fn run_checked_stream_stderr(program: &str, args: &[String]) -> Result<Out
         }
 
         Ok::<Vec<u8>, std::io::Error>(captured)
-    });
+    }));
 
     let status = child
         .wait()
         .await
         .with_context(|| format!("wait for {}", format_command(program, args)))?;
     let stdout = stdout_task
+        .join()
         .await
         .context("join child stdout reader")?
         .with_context(|| format!("read stdout from {}", format_command(program, args)))?;
     let stderr = stderr_task
+        .join()
         .await
         .context("join child stderr reader")?
-        .with_context(|| format!("read stderr from {}", format_command(program, args)))?;
+        .with_context(|| format!("stream stderr from {}", format_command(program, args)))?;
 
     let output = Output {
         status,
