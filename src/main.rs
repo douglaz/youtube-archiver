@@ -1194,6 +1194,30 @@ async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         return Err(err).with_context(|| format!("rename temp file to {}", path.display()));
     }
 
+    sync_parent_dir(path).await?;
+
+    Ok(())
+}
+
+async fn sync_parent_dir(path: &Path) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+
+    #[cfg(unix)]
+    {
+        let dir = fs::File::open(parent)
+            .await
+            .with_context(|| format!("open parent directory {}", parent.display()))?;
+        dir.sync_all()
+            .await
+            .with_context(|| format!("sync parent directory {}", parent.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+    }
+
     Ok(())
 }
 
