@@ -733,7 +733,7 @@ async fn download_audio(
         .await
         .with_context(|| format!("create {}", tmp_dir.display()))?;
 
-    let output_template = tmp_dir.join("audio.%(ext)s");
+    let output_template = yt_dlp_audio_output_template(&tmp_dir);
     let url = canonical_video_url(video_id);
     let args = vec![
         "-f".to_owned(),
@@ -743,7 +743,8 @@ async fn download_audio(
         audio_format.to_owned(),
         "--no-playlist".to_owned(),
         "-o".to_owned(),
-        path_to_string(&output_template),
+        output_template,
+        "--".to_owned(),
         url,
     ];
 
@@ -1898,6 +1899,15 @@ fn unique_temp_name(prefix: &str) -> String {
     format!("{prefix}.{}.{}.{}.tmp", std::process::id(), nanos, counter)
 }
 
+fn yt_dlp_audio_output_template(tmp_dir: &Path) -> String {
+    let mut template = path_to_string(tmp_dir).replace('%', "%%");
+    if !template.ends_with(std::path::MAIN_SEPARATOR) {
+        template.push(std::path::MAIN_SEPARATOR);
+    }
+    template.push_str("audio.%(ext)s");
+    template
+}
+
 fn path_to_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
@@ -2498,6 +2508,16 @@ mod tests {
         assert!(fs::try_exists(&unrelated_dir).await?);
         assert!(fs::try_exists(&ordinary_file).await?);
         Ok(())
+    }
+
+    #[test]
+    fn yt_dlp_audio_output_template_escapes_literal_percent_paths() {
+        let tmp_dir = Path::new("data%dir").join("media").join("id%11");
+        let template = yt_dlp_audio_output_template(&tmp_dir);
+
+        assert!(template.contains("data%%dir"));
+        assert!(template.contains("id%%11"));
+        assert!(template.ends_with(&format!("{}audio.%(ext)s", std::path::MAIN_SEPARATOR)));
     }
 
     #[tokio::test]
