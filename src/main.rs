@@ -836,8 +836,7 @@ async fn transcribe_audio(
             .file_stem()
             .and_then(|stem| stem.to_str())
             .unwrap_or("audio");
-        let whisper_json = find_whisper_output(&tmp_dir, "json", output_stem).await?;
-        let whisper_txt = find_whisper_output(&tmp_dir, "txt", output_stem).await?;
+        let (whisper_json, whisper_txt) = find_whisper_outputs(&tmp_dir, output_stem).await?;
         let final_json = transcript_dir.join("transcript.json");
         let final_txt = transcript_dir.join("transcript.txt");
         replace_transcript_pair(&whisper_json, &whisper_txt, &final_json, &final_txt).await?;
@@ -1797,13 +1796,8 @@ fn process_exists(pid: u32) -> bool {
     Path::new("/proc").join(pid.to_string()).exists()
 }
 
-async fn find_whisper_output(
-    tmp_dir: &Path,
-    extension: &str,
-    preferred_stem: &str,
-) -> Result<PathBuf> {
-    let mut fallback = None;
-    let mut fallback_count = 0usize;
+async fn find_whisper_outputs(tmp_dir: &Path, preferred_stem: &str) -> Result<(PathBuf, PathBuf)> {
+    let mut candidates: Vec<(String, Option<PathBuf>, Option<PathBuf>)> = Vec::new();
     let mut entries = fs::read_dir(tmp_dir)
         .await
         .with_context(|| format!("read {}", tmp_dir.display()))?;
@@ -1822,24 +1816,58 @@ async fn find_whisper_output(
         {
             continue;
         }
-        if path.extension().and_then(|ext| ext.to_str()) != Some(extension) {
+        let Some(extension) = path.extension().and_then(|ext| ext.to_str()) else {
+            continue;
+        };
+        let is_json = extension.eq_ignore_ascii_case("json");
+        let is_txt = extension.eq_ignore_ascii_case("txt");
+        if !is_json && !is_txt {
             continue;
         }
-        if path.file_stem().and_then(|stem| stem.to_str()) == Some(preferred_stem) {
-            return Ok(path);
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+
+        let index = match candidates
+            .iter()
+            .position(|(candidate_stem, _, _)| candidate_stem == stem)
+        {
+            Some(index) => index,
+            None => {
+                candidates.push((stem.to_owned(), None, None));
+                candidates.len() - 1
+            }
+        };
+        let (_, json, txt) = &mut candidates[index];
+        if is_json {
+            *json = Some(path);
+        } else {
+            *txt = Some(path);
         }
-        fallback_count += 1;
-        fallback.get_or_insert(path);
     }
 
-    match (fallback, fallback_count) {
-        (Some(path), 1) => Ok(path),
-        (Some(_), count) => bail!(
-            "whisper produced {count} .{extension} files in {} but none matched stem {preferred_stem}",
+    for (stem, json, txt) in &candidates {
+        if stem == preferred_stem
+            && let (Some(json), Some(txt)) = (json, txt)
+        {
+            return Ok((json.clone(), txt.clone()));
+        }
+    }
+
+    let complete_pairs = candidates
+        .iter()
+        .filter_map(|(_, json, txt)| Some((json.as_ref()?, txt.as_ref()?)))
+        .collect::<Vec<_>>();
+
+    match complete_pairs.as_slice() {
+        [(json, txt)] => Ok(((*json).clone(), (*txt).clone())),
+        [] => bail!(
+            "whisper did not produce a matching .json/.txt transcript pair in {}",
             tmp_dir.display()
         ),
-        (None, _) => bail!(
-            "whisper did not produce a .{extension} file in {}",
+        pairs => bail!(
+            "whisper produced {} transcript pairs in {} but none matched stem {preferred_stem}",
+            pairs.len(),
             tmp_dir.display()
         ),
     }
@@ -2487,7 +2515,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finds_single_whisper_output_without_audio_stem() -> Result<()> {
+    async fn finds_single_whisper_output_pair_without_audio_stem() -> Result<()> {
         let dir = tempdir()?;
         let json = dir.path().join("custom-name.json");
         let txt = dir.path().join("custom-name.txt");
@@ -2495,10 +2523,41 @@ mod tests {
         fs::write(&txt, b"text").await?;
 
         assert_eq!(
-            find_whisper_output(dir.path(), "json", "audio").await?,
-            json
+            find_whisper_outputs(dir.path(), "audio").await?,
+            (json, txt)
         );
-        assert_eq!(find_whisper_output(dir.path(), "txt", "audio").await?, txt);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn whisper_output_pair_fallback_ignores_auxiliary_files() -> Result<()> {
+        let dir = tempdir()?;
+        let json = dir.path().join("custom-name.json");
+        let txt = dir.path().join("custom-name.txt");
+        fs::write(&json, br#"{"segments":[]}"#).await?;
+        fs::write(&txt, b"text").await?;
+        fs::write(dir.path().join("metadata.json"), b"{}").await?;
+
+        assert_eq!(
+            find_whisper_outputs(dir.path(), "audio").await?,
+            (json, txt)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn whisper_output_pair_rejects_ambiguous_fallbacks() -> Result<()> {
+        let dir = tempdir()?;
+        fs::write(dir.path().join("first.json"), b"{}").await?;
+        fs::write(dir.path().join("first.txt"), b"first").await?;
+        fs::write(dir.path().join("second.json"), b"{}").await?;
+        fs::write(dir.path().join("second.txt"), b"second").await?;
+
+        let err = find_whisper_outputs(dir.path(), "audio")
+            .await
+            .expect_err("ambiguous transcript pairs should fail");
+
+        assert!(format!("{err:#}").contains("produced 2 transcript pairs"));
         Ok(())
     }
 
