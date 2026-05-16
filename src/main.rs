@@ -49,7 +49,7 @@ enum Commands {
     Ingest(IngestArgs),
     /// Print a per-video state table.
     Status(DataDirArgs),
-    /// List ledger rows as JSON.
+    /// List archived videos as JSON.
     List(DataDirArgs),
 }
 
@@ -584,7 +584,9 @@ async fn process_video(args: &IngestArgs, ledger: &Ledger, video_id: &str) -> Re
         .await
         .with_context(|| format!("emit wiki markdown for {video_id}"))?;
 
-    ledger.clear_error(video_id)?;
+    if let Err(err) = ledger.clear_error(video_id) {
+        warn!(%video_id, error = %err, "failed to clear stale ledger error after successful processing");
+    }
     Ok(())
 }
 
