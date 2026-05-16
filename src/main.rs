@@ -776,6 +776,7 @@ async fn download_audio(
             .await
             .with_context(|| format!("move audio to {}", final_path.display()))?;
         remove_stale_audio_files(&media_dir, &final_path).await?;
+        sync_parent_dir(&final_path).await?;
         Ok(final_path)
     }
     .await;
