@@ -1518,7 +1518,7 @@ async fn remove_stale_wiki_article(
 async fn cleanup_stage_temp_dirs(parent: &Path, prefix: &str) -> Result<()> {
     #[cfg(not(target_os = "linux"))]
     {
-        warn!(
+        tracing::debug!(
             path = %parent.display(),
             prefix,
             "stale temp cleanup is only enabled on Linux"
@@ -2203,6 +2203,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn cleanup_stage_temp_dirs_removes_previous_stage_dirs() -> Result<()> {
         let dir = tempdir()?;
