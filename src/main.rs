@@ -251,15 +251,22 @@ impl Ledger {
                 "#,
             )
             .context("initialize ledger schema")?;
-        self.ensure_column("uploader", "TEXT")?;
-        self.ensure_column("upload_date", "TEXT")?;
-        self.ensure_column("duration", "INTEGER")?;
-        self.ensure_column("tags", "TEXT")?;
+        self.ensure_column("uploader")?;
+        self.ensure_column("upload_date")?;
+        self.ensure_column("duration")?;
+        self.ensure_column("tags")?;
         Ok(())
     }
 
-    fn ensure_column(&self, name: &str, definition: &str) -> Result<()> {
-        // Migration fragments are hard-coded by callers; never pass user input here.
+    fn ensure_column(&self, name: &str) -> Result<()> {
+        let alter_sql = match name {
+            "uploader" => "ALTER TABLE videos ADD COLUMN uploader TEXT",
+            "upload_date" => "ALTER TABLE videos ADD COLUMN upload_date TEXT",
+            "duration" => "ALTER TABLE videos ADD COLUMN duration INTEGER",
+            "tags" => "ALTER TABLE videos ADD COLUMN tags TEXT",
+            _ => bail!("unsupported ledger migration column {name:?}"),
+        };
+
         let mut stmt = self
             .conn
             .prepare("PRAGMA table_info(videos)")
@@ -273,10 +280,7 @@ impl Ledger {
         }
 
         self.conn
-            .execute(
-                &format!("ALTER TABLE videos ADD COLUMN {name} {definition}"),
-                [],
-            )
+            .execute(alter_sql, [])
             .with_context(|| format!("add ledger column {name}"))?;
         Ok(())
     }
@@ -2296,6 +2300,17 @@ mod tests {
         assert_eq!(metadata.title.as_deref(), Some("A Video"));
         assert_eq!(metadata.channel_title.as_deref(), Some("Rust Channel"));
         assert_eq!(metadata.tags, vec!["rust".to_owned()]);
+        Ok(())
+    }
+
+    #[test]
+    fn ledger_rejects_unknown_migration_columns() -> Result<()> {
+        let ledger = Ledger::open_in_memory()?;
+        let err = ledger
+            .ensure_column("title; DROP TABLE videos")
+            .expect_err("unknown migration column should be rejected");
+
+        assert!(format!("{err:#}").contains("unsupported ledger migration column"));
         Ok(())
     }
 
