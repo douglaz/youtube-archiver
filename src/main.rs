@@ -508,7 +508,7 @@ async fn main() -> Result<()> {
 }
 
 async fn ingest(args: IngestArgs) -> Result<()> {
-    validate_whisper_args(&args.whisper_args)?;
+    validate_whisper_config(&args.whisper_bin, &args.whisper_args)?;
 
     let ledger = Ledger::open(&args.data_dir)?;
     let mode = classify_youtube_url(&args.url);
@@ -1443,7 +1443,17 @@ fn split_command_prefix(command: &str) -> Result<(String, Vec<String>)> {
     Ok((program.to_owned(), args.to_vec()))
 }
 
+fn validate_whisper_config(bin: &str, extra_args: &[String]) -> Result<()> {
+    let (_, prefix_args) = split_command_prefix(bin)?;
+    validate_whisper_args_from("--whisper-bin", &prefix_args)?;
+    validate_whisper_args(extra_args)
+}
+
 fn validate_whisper_args(args: &[String]) -> Result<()> {
+    validate_whisper_args_from("--whisper-arg", args)
+}
+
+fn validate_whisper_args_from(source: &str, args: &[String]) -> Result<()> {
     for arg in args {
         let option = arg
             .split_once('=')
@@ -1453,12 +1463,12 @@ fn validate_whisper_args(args: &[String]) -> Result<()> {
             "-o" | "--output_dir" | "--output-dir" | "--output_format" | "--output-format"
         ) {
             bail!(
-                "--whisper-arg {option} is managed by youtube-archiver; use --data-dir for archive location"
+                "{source} includes {option}, which is managed by youtube-archiver; use --data-dir for archive location"
             );
         }
         if option == "--model" {
             bail!(
-                "--whisper-arg {option} is managed by youtube-archiver; use --whisper-model instead"
+                "{source} includes {option}, which is managed by youtube-archiver; use --whisper-model instead"
             );
         }
     }
@@ -2219,6 +2229,15 @@ mod tests {
         assert_eq!(program, "/tmp/bin/whisper tool");
         assert_eq!(args, ["--initial_prompt", "Alice Bob", "--flag"]);
         Ok(())
+    }
+
+    #[test]
+    fn rejects_managed_whisper_args_in_command_prefix() {
+        let err = validate_whisper_config("whisper --output_dir /tmp/elsewhere", &[])
+            .expect_err("output dir in whisper bin should be rejected");
+
+        assert!(format!("{err:#}").contains("--whisper-bin"));
+        assert!(format!("{err:#}").contains("--data-dir"));
     }
 
     #[test]
