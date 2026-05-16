@@ -1,5 +1,6 @@
-use std::{env, error::Error, process::Command};
+use std::{env, error::Error, path::Path, process::Command};
 
+use rusqlite::{Connection, params};
 use tempfile::tempdir;
 
 const DEFAULT_E2E_URL: &str = "https://www.youtube.com/watch?v=jNQXAC9IVRw";
@@ -51,6 +52,63 @@ fn e2e_ingest_status_and_list() -> Result<(), Box<dyn Error>> {
         "list should emit at least one archived row"
     );
 
+    Ok(())
+}
+
+#[test]
+fn list_stdout_stays_json_when_ledger_warns() -> Result<(), Box<dyn Error>> {
+    let data_dir_guard = tempdir()?;
+    create_ledger_with_bad_tags(data_dir_guard.path())?;
+
+    let output = run_output(&[
+        "list".to_owned(),
+        "--data-dir".to_owned(),
+        data_dir_guard.path().to_string_lossy().into_owned(),
+    ])?;
+    let rows: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+
+    assert_eq!(rows, serde_json::json!([]));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("skipping corrupt ledger row"),
+        "expected ledger warning on stderr"
+    );
+    Ok(())
+}
+
+fn create_ledger_with_bad_tags(data_dir: &Path) -> Result<(), Box<dyn Error>> {
+    std::fs::create_dir_all(data_dir)?;
+    let conn = Connection::open(data_dir.join("state.sqlite"))?;
+    conn.execute_batch(
+        r#"
+        CREATE TABLE videos (
+            video_id TEXT PRIMARY KEY,
+            url TEXT NOT NULL,
+            channel_id TEXT,
+            channel_title TEXT,
+            uploader TEXT,
+            title TEXT,
+            upload_date TEXT,
+            duration INTEGER,
+            tags TEXT,
+            downloaded_at TEXT,
+            transcribed_at TEXT,
+            wiki_emitted_at TEXT,
+            whisper_model TEXT,
+            audio_path TEXT,
+            transcript_path TEXT,
+            wiki_path TEXT,
+            error TEXT
+        );
+        "#,
+    )?;
+    conn.execute(
+        "INSERT INTO videos (video_id, url, tags) VALUES (?1, ?2, ?3)",
+        params![
+            "dQw4w9WgXcQ",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "not json"
+        ],
+    )?;
     Ok(())
 }
 
