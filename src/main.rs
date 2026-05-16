@@ -1335,14 +1335,17 @@ async fn run_checked_stream_stderr(program: &str, args: &[String]) -> Result<Out
         let mut captured = Vec::new();
         let mut truncated = false;
         let mut chunk = [0u8; 8192];
+        let mut live_stdout = tokio::io::stdout();
 
         loop {
             let read = stdout.read(&mut chunk).await?;
             if read == 0 {
                 break;
             }
+            live_stdout.write_all(&chunk[..read]).await?;
             truncated |= push_captured_output(&mut captured, &chunk[..read]);
         }
+        live_stdout.flush().await?;
 
         if truncated {
             add_truncation_notice(&mut captured, "stdout");
@@ -1381,7 +1384,7 @@ async fn run_checked_stream_stderr(program: &str, args: &[String]) -> Result<Out
         .join()
         .await
         .context("join child stdout reader")?
-        .with_context(|| format!("read stdout from {}", format_command(program, args)))?;
+        .with_context(|| format!("stream stdout from {}", format_command(program, args)))?;
     let stderr = stderr_task
         .join()
         .await
