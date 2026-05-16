@@ -862,18 +862,39 @@ fn row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<VideoRow> {
 }
 
 fn classify_youtube_url(url: &str) -> InputMode {
-    let lower = url.to_ascii_lowercase();
-    if lower.contains("youtu.be/")
-        || lower.contains("watch?v=")
-        || lower.contains("/shorts/")
-        || lower.contains("/embed/")
+    let (path, query) = split_url_path_and_query(url);
+    let path = path.to_ascii_lowercase();
+
+    if path.contains("youtu.be/")
+        || (path_has_segment(&path, "watch") && query_param_has_value(query, "v"))
+        || path_has_segment(&path, "shorts")
+        || path_has_segment(&path, "embed")
     {
         InputMode::Video
-    } else if lower.contains("list=") || lower.contains("/playlist") {
+    } else if path_has_segment(&path, "playlist") || query_param_has_value(query, "list") {
         InputMode::Playlist
     } else {
         InputMode::Channel
     }
+}
+
+fn split_url_path_and_query(url: &str) -> (&str, Option<&str>) {
+    let without_fragment = url.split_once('#').map_or(url, |(head, _)| head);
+    without_fragment
+        .split_once('?')
+        .map_or((without_fragment, None), |(path, query)| (path, Some(query)))
+}
+
+fn path_has_segment(path: &str, segment: &str) -> bool {
+    path.split('/').any(|part| part == segment)
+}
+
+fn query_param_has_value(query: Option<&str>, key: &str) -> bool {
+    query
+        .into_iter()
+        .flat_map(|query| query.split('&'))
+        .map(|part| part.split_once('=').unwrap_or((part, "")))
+        .any(|(name, value)| name.eq_ignore_ascii_case(key) && !value.is_empty())
 }
 
 fn metadata_from_value(video_id: &str, value: &Value) -> VideoMetadata {
@@ -1510,6 +1531,10 @@ mod tests {
         );
         assert_eq!(
             classify_youtube_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PL123"),
+            InputMode::Video
+        );
+        assert_eq!(
+            classify_youtube_url("https://www.youtube.com/watch?list=PL123&v=dQw4w9WgXcQ"),
             InputMode::Video
         );
         assert_eq!(
