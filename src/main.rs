@@ -847,8 +847,8 @@ async fn transcribe_audio(
         let (whisper_json, whisper_txt) = find_whisper_outputs(&tmp_dir, output_stem).await?;
         let final_json = transcript_dir.join("transcript.json");
         let final_txt = transcript_dir.join("transcript.txt");
-        ledger.mark_transcription_started(video_id)?;
         replace_transcript_pair(&whisper_json, &whisper_txt, &final_json, &final_txt).await?;
+        ledger.mark_transcription_started(video_id)?;
         Ok(final_json)
     }
     .await;
@@ -1979,6 +1979,9 @@ async fn replace_transcript_pair(
         if backed_up_txt {
             let _ = fs::rename(&backup_txt, final_txt).await;
         }
+        if let Err(sync_err) = sync_pair_parent_dirs(final_json, final_txt).await {
+            warn!(error = %sync_err, "failed to sync transcript directory after backup rollback");
+        }
         return Err(err);
     }
 
@@ -2002,6 +2005,9 @@ async fn replace_transcript_pair(
         if backed_up_txt {
             let _ = fs::rename(&backup_txt, final_txt).await;
         }
+        if let Err(sync_err) = sync_pair_parent_dirs(final_json, final_txt).await {
+            warn!(error = %sync_err, "failed to sync transcript directory after replacement rollback");
+        }
         return Err(err);
     }
 
@@ -2012,6 +2018,16 @@ async fn replace_transcript_pair(
         let _ = fs::remove_file(&backup_txt).await;
     }
 
+    sync_pair_parent_dirs(final_json, final_txt).await?;
+
+    Ok(())
+}
+
+async fn sync_pair_parent_dirs(first: &Path, second: &Path) -> Result<()> {
+    sync_parent_dir(first).await?;
+    if first.parent() != second.parent() {
+        sync_parent_dir(second).await?;
+    }
     Ok(())
 }
 
