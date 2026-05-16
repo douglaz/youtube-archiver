@@ -1295,6 +1295,24 @@ async fn remove_stale_wiki_article(previous_path: Option<&str>, current_path: &P
 }
 
 async fn cleanup_stage_temp_dirs(parent: &Path, prefix: &str) -> Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        warn!(
+            path = %parent.display(),
+            prefix,
+            "stale temp cleanup is only enabled on Linux"
+        );
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        cleanup_stage_temp_dirs_linux(parent, prefix).await
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn cleanup_stage_temp_dirs_linux(parent: &Path, prefix: &str) -> Result<()> {
     let mut entries = fs::read_dir(parent)
         .await
         .with_context(|| format!("read {}", parent.display()))?;
@@ -1326,6 +1344,7 @@ async fn cleanup_stage_temp_dirs(parent: &Path, prefix: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn should_remove_stage_temp_dir(file_name: &str, prefix: &str) -> bool {
     let Some(pid) = stage_temp_dir_pid(file_name, prefix) else {
         return false;
@@ -1333,6 +1352,7 @@ fn should_remove_stage_temp_dir(file_name: &str, prefix: &str) -> bool {
     pid == std::process::id() || !process_exists(pid)
 }
 
+#[cfg(target_os = "linux")]
 fn stage_temp_dir_pid(file_name: &str, prefix: &str) -> Option<u32> {
     let rest = file_name.strip_prefix(prefix)?.strip_prefix('.')?;
     let rest = rest.strip_suffix(".tmp")?;
@@ -1348,16 +1368,9 @@ fn stage_temp_dir_pid(file_name: &str, prefix: &str) -> Option<u32> {
     has_timestamp.then_some(pid)
 }
 
+#[cfg(target_os = "linux")]
 fn process_exists(pid: u32) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        Path::new("/proc").join(pid.to_string()).exists()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pid;
-        true
-    }
+    Path::new("/proc").join(pid.to_string()).exists()
 }
 
 async fn find_whisper_output(
