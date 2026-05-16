@@ -424,13 +424,13 @@ impl Ledger {
         Ok(())
     }
 
-    fn clear_error(&self, video_id: &str) -> Result<()> {
+    fn clear_stale_error(&self, video_id: &str) -> Result<()> {
         self.conn
             .execute(
-                "UPDATE videos SET error = NULL WHERE video_id = ?1",
+                "UPDATE videos SET error = NULL WHERE video_id = ?1 AND error IS NOT NULL",
                 params![video_id],
             )
-            .with_context(|| format!("clear error for {video_id}"))?;
+            .with_context(|| format!("clear stale error for {video_id}"))?;
         Ok(())
     }
 
@@ -585,7 +585,7 @@ async fn process_video(args: &IngestArgs, ledger: &Ledger, video_id: &str) -> Re
         .await
         .with_context(|| format!("emit wiki markdown for {video_id}"))?;
 
-    if let Err(err) = ledger.clear_error(video_id) {
+    if let Err(err) = ledger.clear_stale_error(video_id) {
         warn!(%video_id, error = %err, "failed to clear stale ledger error after successful processing");
     }
     Ok(())
