@@ -891,15 +891,27 @@ async fn status(args: DataDirArgs) -> Result<()> {
 }
 
 fn list(args: DataDirArgs) -> Result<()> {
-    let rows = Ledger::open_read_only(&args.data_dir)?
+    let rows = list_rows(&args.data_dir)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&rows).context("serialize archived video rows")?
+    );
+    Ok(())
+}
+
+fn list_rows(data_dir: &Path) -> Result<Vec<VideoRow>> {
+    let rows = Ledger::open_read_only(data_dir)?
         .map(|ledger| ledger.rows())
         .transpose()?
         .unwrap_or_default();
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&rows).context("serialize ledger rows")?
-    );
-    Ok(())
+    Ok(rows.into_iter().filter(is_archived_row).collect::<Vec<_>>())
+}
+
+fn is_archived_row(row: &VideoRow) -> bool {
+    row.downloaded_at.is_some()
+        && row.transcribed_at.is_some()
+        && row.wiki_emitted_at.is_some()
+        && row.error.is_none()
 }
 
 fn row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<VideoRow> {
@@ -2371,6 +2383,32 @@ mod tests {
         );
         assert!(!fs::try_exists(&old_wiki).await?);
         assert!(fs::try_exists(&new_wiki).await?);
+        Ok(())
+    }
+
+    #[test]
+    fn list_rows_only_include_completed_archived_videos() -> Result<()> {
+        let dir = tempdir()?;
+        let ledger = Ledger::open(dir.path())?;
+        let complete_id = "dQw4w9WgXcQ";
+        let failed_id = "abc1234567_";
+
+        ledger.ensure_video(complete_id, &canonical_video_url(complete_id))?;
+        ledger.mark_downloaded(complete_id, &dir.path().join("media/dQw4w9WgXcQ/audio.m4a"))?;
+        ledger.mark_transcribed(
+            complete_id,
+            "large",
+            &dir.path().join("transcripts/dQw4w9WgXcQ/transcript.json"),
+        )?;
+        ledger.mark_wiki_emitted(complete_id, &dir.path().join("wiki/channel/dQw4w9WgXcQ.md"))?;
+        ledger.ensure_video(failed_id, &canonical_video_url(failed_id))?;
+        ledger.mark_error(failed_id, "download failed")?;
+        drop(ledger);
+
+        let rows = list_rows(dir.path())?;
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].video_id, complete_id);
         Ok(())
     }
 
