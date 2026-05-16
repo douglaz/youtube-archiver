@@ -21,8 +21,8 @@ fn e2e_ingest_status_and_list() -> Result<(), Box<dyn Error>> {
         .unwrap_or_else(|_| DEFAULT_E2E_WHISPER_MODEL.to_owned());
     let audio_format =
         env::var("YTARCH_E2E_AUDIO_FORMAT").unwrap_or_else(|_| DEFAULT_E2E_AUDIO_FORMAT.to_owned());
-    let data_dir = tempdir()?;
-    let data_dir = data_dir.path().to_string_lossy().into_owned();
+    let data_dir_guard = tempdir()?;
+    let data_dir = data_dir_guard.path().to_string_lossy().into_owned();
 
     run_success(&[
         "ingest".to_owned(),
