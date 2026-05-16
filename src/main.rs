@@ -26,7 +26,7 @@ const DEFAULT_DATA_DIR: &str = "data";
 const DEFAULT_WHISPER_BIN: &str = "nix run nixpkgs#openai-whisper --";
 const DEFAULT_WHISPER_MODEL: &str = "large";
 const DEFAULT_AUDIO_FORMAT: &str = "m4a";
-const STREAMED_STDERR_CAPTURE_LIMIT: usize = 64 * 1024;
+const STREAMED_OUTPUT_CAPTURE_LIMIT: usize = 64 * 1024;
 const YOUTUBE_VIDEO_ID_LEN: usize = 11;
 #[cfg(not(target_os = "linux"))]
 const NON_LINUX_STALE_TEMP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
@@ -1327,7 +1327,21 @@ async fn run_checked_stream_stderr(program: &str, args: &[String]) -> Result<Out
 
     let stdout_task = AbortOnDrop::new(tokio::spawn(async move {
         let mut captured = Vec::new();
-        stdout.read_to_end(&mut captured).await?;
+        let mut truncated = false;
+        let mut chunk = [0u8; 8192];
+
+        loop {
+            let read = stdout.read(&mut chunk).await?;
+            if read == 0 {
+                break;
+            }
+            truncated |= push_captured_output(&mut captured, &chunk[..read]);
+        }
+
+        if truncated {
+            add_truncation_notice(&mut captured, "stdout");
+        }
+
         Ok::<Vec<u8>, std::io::Error>(captured)
     }));
     let stderr_task = AbortOnDrop::new(tokio::spawn(async move {
@@ -1342,16 +1356,12 @@ async fn run_checked_stream_stderr(program: &str, args: &[String]) -> Result<Out
                 break;
             }
             live_stderr.write_all(&chunk[..read]).await?;
-            truncated |= push_captured_stderr(&mut captured, &chunk[..read]);
+            truncated |= push_captured_output(&mut captured, &chunk[..read]);
         }
         live_stderr.flush().await?;
 
         if truncated {
-            let mut prefixed =
-                format!("[stderr truncated to last {STREAMED_STDERR_CAPTURE_LIMIT} bytes]\n")
-                    .into_bytes();
-            prefixed.extend_from_slice(&captured);
-            captured = prefixed;
+            add_truncation_notice(&mut captured, "stderr");
         }
 
         Ok::<Vec<u8>, std::io::Error>(captured)
@@ -1380,19 +1390,29 @@ async fn run_checked_stream_stderr(program: &str, args: &[String]) -> Result<Out
     ensure_success(program, args, output)
 }
 
-fn push_captured_stderr(captured: &mut Vec<u8>, chunk: &[u8]) -> bool {
+fn push_captured_output(captured: &mut Vec<u8>, chunk: &[u8]) -> bool {
+    if chunk.len() >= STREAMED_OUTPUT_CAPTURE_LIMIT {
+        captured.clear();
+        captured.extend_from_slice(&chunk[chunk.len() - STREAMED_OUTPUT_CAPTURE_LIMIT..]);
+        return true;
+    }
+
     let mut truncated = false;
-    if captured.len() + chunk.len() > STREAMED_STDERR_CAPTURE_LIMIT {
-        let excess = captured.len() + chunk.len() - STREAMED_STDERR_CAPTURE_LIMIT;
-        if excess >= captured.len() {
-            captured.clear();
-        } else {
-            captured.drain(..excess);
-        }
+    if captured.len() + chunk.len() > STREAMED_OUTPUT_CAPTURE_LIMIT {
+        let excess = captured.len() + chunk.len() - STREAMED_OUTPUT_CAPTURE_LIMIT;
+        captured.drain(..excess);
         truncated = true;
     }
     captured.extend_from_slice(chunk);
     truncated
+}
+
+fn add_truncation_notice(captured: &mut Vec<u8>, stream_name: &str) {
+    let mut prefixed =
+        format!("[{stream_name} truncated to last {STREAMED_OUTPUT_CAPTURE_LIMIT} bytes]\n")
+            .into_bytes();
+    prefixed.append(captured);
+    *captured = prefixed;
 }
 
 fn ensure_success(program: &str, args: &[String], output: Output) -> Result<Output> {
@@ -2518,6 +2538,15 @@ mod tests {
         assert!(template.contains("data%%dir"));
         assert!(template.contains("id%%11"));
         assert!(template.ends_with(&format!("{}audio.%(ext)s", std::path::MAIN_SEPARATOR)));
+    }
+
+    #[test]
+    fn captured_stream_output_keeps_last_bytes() {
+        let mut captured = vec![b'a'; STREAMED_OUTPUT_CAPTURE_LIMIT - 2];
+
+        assert!(push_captured_output(&mut captured, b"bcde"));
+        assert_eq!(captured.len(), STREAMED_OUTPUT_CAPTURE_LIMIT);
+        assert_eq!(&captured[STREAMED_OUTPUT_CAPTURE_LIMIT - 4..], b"bcde");
     }
 
     #[tokio::test]
