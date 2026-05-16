@@ -57,6 +57,13 @@ struct IngestArgs {
     )]
     whisper_bin: String,
 
+    #[arg(
+        long = "whisper-arg",
+        value_name = "ARG",
+        help = "Extra argument passed to the Whisper command; repeat for multiple args"
+    )]
+    whisper_args: Vec<String>,
+
     #[arg(long)]
     limit: Option<usize>,
 
@@ -93,13 +100,23 @@ struct VideoMetadata {
     tags: Vec<String>,
 }
 
+struct WhisperConfig<'a> {
+    bin: &'a str,
+    model: &'a str,
+    extra_args: &'a [String],
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct VideoRow {
     video_id: String,
     url: String,
     channel_id: Option<String>,
     channel_title: Option<String>,
+    uploader: Option<String>,
     title: Option<String>,
+    upload_date: Option<String>,
+    duration: Option<u64>,
+    tags: Vec<String>,
     downloaded_at: Option<String>,
     transcribed_at: Option<String>,
     wiki_emitted_at: Option<String>,
@@ -155,7 +172,11 @@ impl Ledger {
                     url TEXT NOT NULL,
                     channel_id TEXT,
                     channel_title TEXT,
+                    uploader TEXT,
                     title TEXT,
+                    upload_date TEXT,
+                    duration INTEGER,
+                    tags TEXT,
                     downloaded_at TEXT,
                     transcribed_at TEXT,
                     wiki_emitted_at TEXT,
@@ -168,6 +189,32 @@ impl Ledger {
                 "#,
             )
             .context("initialize ledger schema")?;
+        self.ensure_column("uploader", "TEXT")?;
+        self.ensure_column("upload_date", "TEXT")?;
+        self.ensure_column("duration", "INTEGER")?;
+        self.ensure_column("tags", "TEXT")?;
+        Ok(())
+    }
+
+    fn ensure_column(&self, name: &str, definition: &str) -> Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare("PRAGMA table_info(videos)")
+            .context("inspect ledger schema")?;
+        let mut rows = stmt.query([]).context("read ledger schema")?;
+        while let Some(row) = rows.next().context("read ledger schema row")? {
+            let column_name: String = row.get(1).context("read ledger column name")?;
+            if column_name == name {
+                return Ok(());
+            }
+        }
+
+        self.conn
+            .execute(
+                &format!("ALTER TABLE videos ADD COLUMN {name} {definition}"),
+                [],
+            )
+            .with_context(|| format!("add ledger column {name}"))?;
         Ok(())
     }
 
@@ -186,26 +233,84 @@ impl Ledger {
     }
 
     fn upsert_metadata(&self, metadata: &VideoMetadata) -> Result<()> {
+        let duration = metadata
+            .duration
+            .map(i64::try_from)
+            .transpose()
+            .context("duration does not fit sqlite integer")?;
+        let tags = serde_json::to_string(&metadata.tags).context("serialize metadata tags")?;
         self.conn
             .execute(
                 r#"
-                INSERT INTO videos (video_id, url, channel_id, channel_title, title)
-                VALUES (?1, ?2, ?3, ?4, ?5)
+                INSERT INTO videos (
+                    video_id, url, channel_id, channel_title, uploader, title,
+                    upload_date, duration, tags
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                 ON CONFLICT(video_id) DO UPDATE SET
                     url = excluded.url,
                     channel_id = excluded.channel_id,
                     channel_title = excluded.channel_title,
-                    title = excluded.title
+                    uploader = excluded.uploader,
+                    title = excluded.title,
+                    upload_date = excluded.upload_date,
+                    duration = excluded.duration,
+                    tags = excluded.tags
                 "#,
                 params![
                     metadata.video_id,
                     metadata.url,
                     metadata.channel_id,
                     metadata.channel_title,
-                    metadata.title
+                    metadata.uploader,
+                    metadata.title,
+                    metadata.upload_date,
+                    duration,
+                    tags
                 ],
             )
             .with_context(|| format!("upsert metadata for {}", metadata.video_id))?;
+        Ok(())
+    }
+
+    fn clear_error(&self, video_id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE videos SET error = NULL WHERE video_id = ?1",
+                params![video_id],
+            )
+            .with_context(|| format!("clear error for {video_id}"))?;
+        Ok(())
+    }
+
+    fn clear_download_state(&self, video_id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                r#"
+                UPDATE videos
+                SET downloaded_at = NULL,
+                    audio_path = NULL
+                WHERE video_id = ?1
+                "#,
+                params![video_id],
+            )
+            .with_context(|| format!("clear download state for {video_id}"))?;
+        Ok(())
+    }
+
+    fn clear_transcription_state(&self, video_id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                r#"
+                UPDATE videos
+                SET transcribed_at = NULL,
+                    whisper_model = NULL,
+                    transcript_path = NULL
+                WHERE video_id = ?1
+                "#,
+                params![video_id],
+            )
+            .with_context(|| format!("clear transcription state for {video_id}"))?;
         Ok(())
     }
 
@@ -277,7 +382,8 @@ impl Ledger {
         self.conn
             .query_row(
                 r#"
-                SELECT video_id, url, channel_id, channel_title, title,
+                SELECT video_id, url, channel_id, channel_title, uploader, title,
+                       upload_date, duration, tags,
                        downloaded_at, transcribed_at, wiki_emitted_at,
                        whisper_model, audio_path, transcript_path, wiki_path, error
                 FROM videos
@@ -295,7 +401,8 @@ impl Ledger {
             .conn
             .prepare(
                 r#"
-                SELECT video_id, url, channel_id, channel_title, title,
+                SELECT video_id, url, channel_id, channel_title, uploader, title,
+                       upload_date, duration, tags,
                        downloaded_at, transcribed_at, wiki_emitted_at,
                        whisper_model, audio_path, transcript_path, wiki_path, error
                 FROM videos
@@ -347,6 +454,7 @@ async fn ingest(args: IngestArgs) -> Result<()> {
 
         match process_video(&args, &ledger, &video_id).await {
             Ok(()) => {
+                ledger.clear_error(&video_id)?;
                 succeeded += 1;
                 info!(%video_id, "video processed");
             }
@@ -368,7 +476,6 @@ async fn ingest(args: IngestArgs) -> Result<()> {
 
 async fn process_video(args: &IngestArgs, ledger: &Ledger, video_id: &str) -> Result<()> {
     let metadata = load_or_fetch_metadata(&args.data_dir, ledger, video_id, args.force).await?;
-    ledger.upsert_metadata(&metadata)?;
 
     let audio_path = download_audio(
         &args.data_dir,
@@ -385,8 +492,11 @@ async fn process_video(args: &IngestArgs, ledger: &Ledger, video_id: &str) -> Re
         ledger,
         video_id,
         &audio_path,
-        &args.whisper_bin,
-        &args.whisper_model,
+        WhisperConfig {
+            bin: &args.whisper_bin,
+            model: &args.whisper_model,
+            extra_args: &args.whisper_args,
+        },
         args.force,
     )
     .await
@@ -436,13 +546,15 @@ async fn load_or_fetch_metadata(
     let media_dir = data_dir.join("media").join(video_id);
     let info_path = media_dir.join("info.json");
 
-    if !force && info_path.exists() {
+    if !force && fs::try_exists(&info_path).await.unwrap_or(false) {
         let bytes = fs::read(&info_path)
             .await
             .with_context(|| format!("read existing {}", info_path.display()))?;
         let value: Value = serde_json::from_slice(&bytes)
             .with_context(|| format!("parse existing {}", info_path.display()))?;
-        return Ok(metadata_from_value(video_id, &value));
+        let metadata = metadata_from_value(video_id, &value);
+        ledger.upsert_metadata(&metadata)?;
+        return Ok(metadata);
     }
 
     fs::create_dir_all(&media_dir)
@@ -467,12 +579,12 @@ async fn download_audio(
     audio_format: &str,
     force: bool,
 ) -> Result<PathBuf> {
-    if let Some(row) = ledger
-        .row(video_id)?
-        .filter(|row| should_skip_download(row, force))
+    if let Some(row) = ledger.row(video_id)?
+        && should_skip_download_async(&row, force).await
     {
         return Ok(PathBuf::from(
-            row.audio_path.expect("checked by should_skip_download"),
+            row.audio_path
+                .expect("checked by should_skip_download_async"),
         ));
     }
 
@@ -499,22 +611,35 @@ async fn download_audio(
         url,
     ];
 
-    let result = run_checked("yt-dlp", &args).await;
-    if let Err(err) = result {
-        let _ = fs::remove_dir_all(&tmp_dir).await;
-        return Err(err);
+    let result: Result<PathBuf> = async {
+        run_checked("yt-dlp", &args).await?;
+        let downloaded = find_audio_file(&tmp_dir, audio_format).await?;
+        let extension = downloaded
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or(audio_format);
+        let final_path = media_dir.join(format!("audio.{extension}"));
+        ledger.clear_download_state(video_id)?;
+        fs::rename(&downloaded, &final_path)
+            .await
+            .with_context(|| format!("move audio to {}", final_path.display()))?;
+        remove_stale_audio_files(&media_dir, &final_path).await?;
+        Ok(final_path)
     }
+    .await;
 
-    let downloaded = find_audio_file(&tmp_dir, audio_format).await?;
-    let extension = downloaded
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or(audio_format);
-    let final_path = media_dir.join(format!("audio.{extension}"));
-    fs::rename(&downloaded, &final_path)
-        .await
-        .with_context(|| format!("move audio to {}", final_path.display()))?;
-    let _ = fs::remove_dir_all(&tmp_dir).await;
+    let cleanup = fs::remove_dir_all(&tmp_dir).await;
+    let final_path = match result {
+        Ok(final_path) => {
+            cleanup.with_context(|| format!("remove {}", tmp_dir.display()))?;
+            final_path
+        }
+        Err(err) => {
+            let _ = cleanup;
+            return Err(err);
+        }
+    };
+
     ledger.mark_downloaded(video_id, &final_path)?;
     Ok(final_path)
 }
@@ -524,17 +649,15 @@ async fn transcribe_audio(
     ledger: &Ledger,
     video_id: &str,
     audio_path: &Path,
-    whisper_bin: &str,
-    whisper_model: &str,
+    whisper: WhisperConfig<'_>,
     force: bool,
 ) -> Result<PathBuf> {
-    if let Some(row) = ledger
-        .row(video_id)?
-        .filter(|row| should_skip_transcription(row, whisper_model, force))
+    if let Some(row) = ledger.row(video_id)?
+        && should_skip_transcription_async(&row, whisper.model, force).await
     {
         return Ok(PathBuf::from(
             row.transcript_path
-                .expect("checked by should_skip_transcription"),
+                .expect("checked by should_skip_transcription_async"),
         ));
     }
 
@@ -547,49 +670,49 @@ async fn transcribe_audio(
         .await
         .with_context(|| format!("create {}", tmp_dir.display()))?;
 
-    let (program, mut args) = split_command_prefix(whisper_bin)?;
+    let (program, mut args) = split_command_prefix(whisper.bin)?;
     args.extend([
         path_to_string(audio_path),
         "--model".to_owned(),
-        whisper_model.to_owned(),
+        whisper.model.to_owned(),
+    ]);
+    args.extend(whisper.extra_args.iter().cloned());
+    args.extend([
         "--output_dir".to_owned(),
         path_to_string(&tmp_dir),
         "--output_format".to_owned(),
         "all".to_owned(),
     ]);
 
-    let result = run_checked(&program, &args).await;
-    if let Err(err) = result {
-        let _ = fs::remove_dir_all(&tmp_dir).await;
-        return Err(err);
+    let result: Result<PathBuf> = async {
+        run_checked(&program, &args).await?;
+        let output_stem = audio_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("audio");
+        let whisper_json = find_whisper_output(&tmp_dir, "json", output_stem).await?;
+        let whisper_txt = find_whisper_output(&tmp_dir, "txt", output_stem).await?;
+        let final_json = transcript_dir.join("transcript.json");
+        let final_txt = transcript_dir.join("transcript.txt");
+        ledger.clear_transcription_state(video_id)?;
+        replace_transcript_pair(&whisper_json, &whisper_txt, &final_json, &final_txt).await?;
+        Ok(final_json)
     }
+    .await;
 
-    let output_stem = audio_path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("audio");
-    let whisper_json = tmp_dir.join(format!("{output_stem}.json"));
-    let whisper_txt = tmp_dir.join(format!("{output_stem}.txt"));
-    let final_json = transcript_dir.join("transcript.json");
-    let final_txt = transcript_dir.join("transcript.txt");
+    let cleanup = fs::remove_dir_all(&tmp_dir).await;
+    let final_json = match result {
+        Ok(final_json) => {
+            cleanup.with_context(|| format!("remove {}", tmp_dir.display()))?;
+            final_json
+        }
+        Err(err) => {
+            let _ = cleanup;
+            return Err(err);
+        }
+    };
 
-    if !whisper_json.exists() || !whisper_txt.exists() {
-        let _ = fs::remove_dir_all(&tmp_dir).await;
-        bail!(
-            "whisper completed but did not produce {} and {}",
-            whisper_json.display(),
-            whisper_txt.display()
-        );
-    }
-
-    fs::rename(&whisper_json, &final_json)
-        .await
-        .with_context(|| format!("move transcript JSON to {}", final_json.display()))?;
-    fs::rename(&whisper_txt, &final_txt)
-        .await
-        .with_context(|| format!("move transcript text to {}", final_txt.display()))?;
-    let _ = fs::remove_dir_all(&tmp_dir).await;
-    ledger.mark_transcribed(video_id, whisper_model, &final_json)?;
+    ledger.mark_transcribed(video_id, whisper.model, &final_json)?;
     Ok(final_json)
 }
 
@@ -599,12 +722,11 @@ async fn emit_wiki_article(
     metadata: &VideoMetadata,
     force: bool,
 ) -> Result<PathBuf> {
-    if let Some(row) = ledger
-        .row(&metadata.video_id)?
-        .filter(|row| should_skip_wiki(row, force))
+    if let Some(row) = ledger.row(&metadata.video_id)?
+        && should_skip_wiki_async(&row, force).await
     {
         return Ok(PathBuf::from(
-            row.wiki_path.expect("checked by should_skip_wiki"),
+            row.wiki_path.expect("checked by should_skip_wiki_async"),
         ));
     }
 
@@ -648,9 +770,9 @@ fn status(args: DataDirArgs) -> Result<()> {
         println!(
             "{:<14} {:<10} {:<11} {:<10} {:<7} {}",
             row.video_id,
-            stage_state(&row.downloaded_at, &row.audio_path),
+            download_state(&row),
             transcript_state(&row),
-            stage_state(&row.wiki_emitted_at, &row.wiki_path),
+            wiki_state(&row),
             if row.error.is_some() { "yes" } else { "-" },
             row.title.as_deref().unwrap_or("-")
         );
@@ -672,20 +794,29 @@ fn list(args: DataDirArgs) -> Result<()> {
 }
 
 fn row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<VideoRow> {
+    let duration: Option<i64> = row.get(7)?;
+    let tags_json: Option<String> = row.get(8)?;
     Ok(VideoRow {
         video_id: row.get(0)?,
         url: row.get(1)?,
         channel_id: row.get(2)?,
         channel_title: row.get(3)?,
-        title: row.get(4)?,
-        downloaded_at: row.get(5)?,
-        transcribed_at: row.get(6)?,
-        wiki_emitted_at: row.get(7)?,
-        whisper_model: row.get(8)?,
-        audio_path: row.get(9)?,
-        transcript_path: row.get(10)?,
-        wiki_path: row.get(11)?,
-        error: row.get(12)?,
+        uploader: row.get(4)?,
+        title: row.get(5)?,
+        upload_date: row.get(6)?,
+        duration: duration.and_then(|value| u64::try_from(value).ok()),
+        tags: tags_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str(value).ok())
+            .unwrap_or_default(),
+        downloaded_at: row.get(9)?,
+        transcribed_at: row.get(10)?,
+        wiki_emitted_at: row.get(11)?,
+        whisper_model: row.get(12)?,
+        audio_path: row.get(13)?,
+        transcript_path: row.get(14)?,
+        wiki_path: row.get(15)?,
+        error: row.get(16)?,
     })
 }
 
@@ -762,6 +893,7 @@ fn render_wiki_markdown(metadata: &VideoMetadata, transcript: &str) -> Result<St
         .channel_title
         .as_deref()
         .or(metadata.uploader.as_deref())
+        .or(metadata.channel_id.as_deref())
         .unwrap_or("Unknown Channel");
     let uploader = metadata.uploader.as_deref().unwrap_or(channel);
     let upload_date = metadata.upload_date.as_deref();
@@ -822,6 +954,10 @@ fn should_skip_download(row: &VideoRow, force: bool) -> bool {
             .is_some_and(|path| Path::new(path).exists())
 }
 
+async fn should_skip_download_async(row: &VideoRow, force: bool) -> bool {
+    !force && row.downloaded_at.is_some() && async_path_exists(row.audio_path.as_deref()).await
+}
+
 fn should_skip_transcription(row: &VideoRow, whisper_model: &str, force: bool) -> bool {
     if force || row.transcribed_at.is_none() || row.whisper_model.as_deref() != Some(whisper_model)
     {
@@ -835,6 +971,21 @@ fn should_skip_transcription(row: &VideoRow, whisper_model: &str, force: bool) -
     })
 }
 
+async fn should_skip_transcription_async(row: &VideoRow, whisper_model: &str, force: bool) -> bool {
+    if force || row.transcribed_at.is_none() || row.whisper_model.as_deref() != Some(whisper_model)
+    {
+        return false;
+    }
+
+    let Some(path) = row.transcript_path.as_deref() else {
+        return false;
+    };
+    let json_path = Path::new(path);
+    let txt_path = json_path.with_file_name("transcript.txt");
+    fs::try_exists(json_path).await.unwrap_or(false)
+        && fs::try_exists(txt_path).await.unwrap_or(false)
+}
+
 fn should_skip_wiki(row: &VideoRow, force: bool) -> bool {
     !force
         && row.wiki_emitted_at.is_some()
@@ -844,10 +995,31 @@ fn should_skip_wiki(row: &VideoRow, force: bool) -> bool {
             .is_some_and(|path| Path::new(path).exists())
 }
 
-fn stage_state(timestamp: &Option<String>, path: &Option<String>) -> &'static str {
-    if timestamp.is_none() {
+async fn should_skip_wiki_async(row: &VideoRow, force: bool) -> bool {
+    !force && row.wiki_emitted_at.is_some() && async_path_exists(row.wiki_path.as_deref()).await
+}
+
+async fn async_path_exists(path: Option<&str>) -> bool {
+    match path {
+        Some(path) => fs::try_exists(path).await.unwrap_or(false),
+        None => false,
+    }
+}
+
+fn download_state(row: &VideoRow) -> &'static str {
+    if row.downloaded_at.is_none() {
         "-"
-    } else if path.as_deref().is_some_and(|path| Path::new(path).exists()) {
+    } else if should_skip_download(row, false) {
+        "done"
+    } else {
+        "missing"
+    }
+}
+
+fn wiki_state(row: &VideoRow) -> &'static str {
+    if row.wiki_emitted_at.is_none() {
+        "-"
+    } else if should_skip_wiki(row, false) {
         "done"
     } else {
         "missing"
@@ -888,12 +1060,86 @@ async fn run_checked(program: &str, args: &[String]) -> Result<std::process::Out
 }
 
 fn split_command_prefix(command: &str) -> Result<(String, Vec<String>)> {
-    let mut parts = command.split_whitespace();
-    let program = parts
-        .next()
-        .ok_or_else(|| anyhow!("whisper command must not be empty"))?
-        .to_owned();
-    Ok((program, parts.map(str::to_owned).collect()))
+    let parts = shell_words(command)?;
+    let (program, args) = parts
+        .split_first()
+        .ok_or_else(|| anyhow!("whisper command must not be empty"))?;
+    Ok((program.to_owned(), args.to_vec()))
+}
+
+fn shell_words(command: &str) -> Result<Vec<String>> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote = Quote::None;
+    let mut in_word = false;
+    let mut chars = command.chars();
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            Quote::None => match ch {
+                ch if ch.is_whitespace() => {
+                    if in_word {
+                        words.push(std::mem::take(&mut current));
+                        in_word = false;
+                    }
+                }
+                '\'' => {
+                    quote = Quote::Single;
+                    in_word = true;
+                }
+                '"' => {
+                    quote = Quote::Double;
+                    in_word = true;
+                }
+                '\\' => {
+                    let escaped = chars
+                        .next()
+                        .ok_or_else(|| anyhow!("trailing escape in command prefix"))?;
+                    current.push(escaped);
+                    in_word = true;
+                }
+                _ => {
+                    current.push(ch);
+                    in_word = true;
+                }
+            },
+            Quote::Single => {
+                if ch == '\'' {
+                    quote = Quote::None;
+                } else {
+                    current.push(ch);
+                }
+            }
+            Quote::Double => match ch {
+                '"' => quote = Quote::None,
+                '\\' => {
+                    let escaped = chars
+                        .next()
+                        .ok_or_else(|| anyhow!("trailing escape in command prefix"))?;
+                    current.push(escaped);
+                }
+                _ => current.push(ch),
+            },
+        }
+    }
+
+    match quote {
+        Quote::None => {
+            if in_word {
+                words.push(current);
+            }
+            Ok(words)
+        }
+        Quote::Single => bail!("unterminated single quote in command prefix"),
+        Quote::Double => bail!("unterminated double quote in command prefix"),
+    }
 }
 
 fn format_command(program: &str, args: &[String]) -> String {
@@ -975,6 +1221,146 @@ async fn find_audio_file(tmp_dir: &Path, preferred_ext: &str) -> Result<PathBuf>
     })
 }
 
+async fn remove_stale_audio_files(media_dir: &Path, keep_path: &Path) -> Result<()> {
+    let mut entries = fs::read_dir(media_dir)
+        .await
+        .with_context(|| format!("read {}", media_dir.display()))?;
+
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .with_context(|| format!("read entry in {}", media_dir.display()))?
+    {
+        let path = entry.path();
+        if path == keep_path {
+            continue;
+        }
+        if !entry
+            .file_type()
+            .await
+            .with_context(|| format!("stat {}", path.display()))?
+            .is_file()
+        {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if file_name.starts_with("audio.") {
+            fs::remove_file(&path)
+                .await
+                .with_context(|| format!("remove stale audio {}", path.display()))?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn find_whisper_output(
+    tmp_dir: &Path,
+    extension: &str,
+    preferred_stem: &str,
+) -> Result<PathBuf> {
+    let mut fallback = None;
+    let mut fallback_count = 0usize;
+    let mut entries = fs::read_dir(tmp_dir)
+        .await
+        .with_context(|| format!("read {}", tmp_dir.display()))?;
+
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .with_context(|| format!("read entry in {}", tmp_dir.display()))?
+    {
+        let path = entry.path();
+        if !entry
+            .file_type()
+            .await
+            .with_context(|| format!("stat {}", path.display()))?
+            .is_file()
+        {
+            continue;
+        }
+        if path.extension().and_then(|ext| ext.to_str()) != Some(extension) {
+            continue;
+        }
+        if path.file_stem().and_then(|stem| stem.to_str()) == Some(preferred_stem) {
+            return Ok(path);
+        }
+        fallback_count += 1;
+        fallback.get_or_insert(path);
+    }
+
+    match (fallback, fallback_count) {
+        (Some(path), 1) => Ok(path),
+        (Some(_), count) => bail!(
+            "whisper produced {count} .{extension} files in {} but none matched stem {preferred_stem}",
+            tmp_dir.display()
+        ),
+        (None, _) => bail!(
+            "whisper did not produce a .{extension} file in {}",
+            tmp_dir.display()
+        ),
+    }
+}
+
+async fn replace_transcript_pair(
+    source_json: &Path,
+    source_txt: &Path,
+    final_json: &Path,
+    final_txt: &Path,
+) -> Result<()> {
+    let backup_json = temp_path_for(final_json)?;
+    let backup_txt = temp_path_for(final_txt)?;
+    let mut backed_up_json = false;
+    let mut backed_up_txt = false;
+
+    if fs::try_exists(final_txt).await.unwrap_or(false) {
+        fs::rename(final_txt, &backup_txt)
+            .await
+            .with_context(|| format!("back up {}", final_txt.display()))?;
+        backed_up_txt = true;
+    }
+    if fs::try_exists(final_json).await.unwrap_or(false) {
+        fs::rename(final_json, &backup_json)
+            .await
+            .with_context(|| format!("back up {}", final_json.display()))?;
+        backed_up_json = true;
+    }
+
+    let result: Result<()> = async {
+        fs::rename(source_json, final_json)
+            .await
+            .with_context(|| format!("move transcript JSON to {}", final_json.display()))?;
+        fs::rename(source_txt, final_txt)
+            .await
+            .with_context(|| format!("move transcript text to {}", final_txt.display()))?;
+        Ok(())
+    }
+    .await;
+
+    if let Err(err) = result {
+        let _ = fs::remove_file(final_json).await;
+        let _ = fs::remove_file(final_txt).await;
+        if backed_up_json {
+            let _ = fs::rename(&backup_json, final_json).await;
+        }
+        if backed_up_txt {
+            let _ = fs::rename(&backup_txt, final_txt).await;
+        }
+        return Err(err);
+    }
+
+    if backed_up_json {
+        let _ = fs::remove_file(&backup_json).await;
+    }
+    if backed_up_txt {
+        let _ = fs::remove_file(&backup_txt).await;
+    }
+
+    Ok(())
+}
+
 fn temp_path_for(path: &Path) -> Result<PathBuf> {
     let parent = path
         .parent()
@@ -1017,7 +1403,11 @@ mod tests {
             url: canonical_video_url("abc123"),
             channel_id: None,
             channel_title: None,
+            uploader: None,
             title: None,
+            upload_date: None,
+            duration: None,
+            tags: Vec::new(),
             downloaded_at: None,
             transcribed_at: None,
             wiki_emitted_at: None,
@@ -1089,6 +1479,117 @@ mod tests {
         assert!(markdown.contains("video_id: \"abc123\"\n"));
         assert!(markdown.contains("  - \"rust\"\n"));
         assert!(markdown.ends_with("\n\nhello transcript\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn renders_channel_id_as_channel_fallback() -> Result<()> {
+        let metadata = VideoMetadata {
+            video_id: "abc123".to_owned(),
+            url: canonical_video_url("abc123"),
+            channel_id: Some("UC123".to_owned()),
+            channel_title: None,
+            uploader: None,
+            title: None,
+            upload_date: None,
+            duration: None,
+            tags: Vec::new(),
+        };
+
+        let markdown = render_wiki_markdown(&metadata, "hello")?;
+
+        assert!(markdown.contains("channel: \"UC123\"\n"));
+        assert!(markdown.contains("uploader: \"UC123\"\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn parses_quoted_whisper_command_prefix() -> Result<()> {
+        let (program, args) =
+            split_command_prefix(r#""/tmp/bin/whisper tool" --initial_prompt "Alice Bob" --flag"#)?;
+
+        assert_eq!(program, "/tmp/bin/whisper tool");
+        assert_eq!(args, ["--initial_prompt", "Alice Bob", "--flag"]);
+        Ok(())
+    }
+
+    #[test]
+    fn ledger_persists_frontmatter_metadata_fields() -> Result<()> {
+        let ledger = Ledger::open_in_memory()?;
+        let metadata = VideoMetadata {
+            video_id: "abc123".to_owned(),
+            url: canonical_video_url("abc123"),
+            channel_id: Some("channel-id".to_owned()),
+            channel_title: Some("Channel Title".to_owned()),
+            uploader: Some("Uploader".to_owned()),
+            title: Some("Title".to_owned()),
+            upload_date: Some("20260102".to_owned()),
+            duration: Some(123),
+            tags: vec!["rust".to_owned(), "youtube".to_owned()],
+        };
+
+        ledger.upsert_metadata(&metadata)?;
+        let row = ledger.row("abc123")?.expect("row exists");
+
+        assert_eq!(row.uploader.as_deref(), Some("Uploader"));
+        assert_eq!(row.upload_date.as_deref(), Some("20260102"));
+        assert_eq!(row.duration, Some(123));
+        assert_eq!(row.tags, vec!["rust".to_owned(), "youtube".to_owned()]);
+        Ok(())
+    }
+
+    #[test]
+    fn clear_error_removes_stale_ledger_error() -> Result<()> {
+        let ledger = Ledger::open_in_memory()?;
+        let video_id = "abc123";
+        ledger.ensure_video(video_id, &canonical_video_url(video_id))?;
+        ledger.mark_error(video_id, "old failure")?;
+
+        assert_eq!(
+            ledger.row(video_id)?.expect("row exists").error.as_deref(),
+            Some("old failure")
+        );
+
+        ledger.clear_error(video_id)?;
+
+        assert!(ledger.row(video_id)?.expect("row exists").error.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finds_single_whisper_output_without_audio_stem() -> Result<()> {
+        let dir = tempdir()?;
+        let json = dir.path().join("custom-name.json");
+        let txt = dir.path().join("custom-name.txt");
+        fs::write(&json, b"{}").await?;
+        fs::write(&txt, b"text").await?;
+
+        assert_eq!(
+            find_whisper_output(dir.path(), "json", "audio").await?,
+            json
+        );
+        assert_eq!(find_whisper_output(dir.path(), "txt", "audio").await?, txt);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replace_transcript_pair_swaps_both_outputs() -> Result<()> {
+        let dir = tempdir()?;
+        let source_json = dir.path().join("new.json");
+        let source_txt = dir.path().join("new.txt");
+        let final_json = dir.path().join("transcript.json");
+        let final_txt = dir.path().join("transcript.txt");
+        fs::write(&source_json, br#"{"new":true}"#).await?;
+        fs::write(&source_txt, b"new text").await?;
+        fs::write(&final_json, br#"{"old":true}"#).await?;
+        fs::write(&final_txt, b"old text").await?;
+
+        replace_transcript_pair(&source_json, &source_txt, &final_json, &final_txt).await?;
+
+        assert_eq!(fs::read(&final_json).await?, br#"{"new":true}"#);
+        assert_eq!(fs::read(&final_txt).await?, b"new text");
+        assert!(!fs::try_exists(&source_json).await?);
+        assert!(!fs::try_exists(&source_txt).await?);
         Ok(())
     }
 
