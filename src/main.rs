@@ -640,7 +640,7 @@ async fn download_audio(
     force: bool,
 ) -> Result<PathBuf> {
     if let Some(row) = ledger.row(video_id)?
-        && should_skip_download_async(data_dir, &row, force).await
+        && should_skip_download_async(data_dir, &row, audio_format, force).await
     {
         let audio_path = row
             .audio_path
@@ -1055,19 +1055,42 @@ fn slugify(value: &str) -> String {
 }
 
 #[cfg(test)]
-fn should_skip_download(data_dir: &Path, row: &VideoRow, force: bool) -> bool {
+fn should_skip_download(data_dir: &Path, row: &VideoRow, audio_format: &str, force: bool) -> bool {
     !force
         && row.downloaded_at.is_some()
-        && row
-            .audio_path
-            .as_deref()
-            .is_some_and(|path| ledger_path_to_fs_path(data_dir, path).exists())
+        && row.audio_path.as_deref().is_some_and(|path| {
+            audio_path_matches_format(path, audio_format)
+                && ledger_path_to_fs_path(data_dir, path).exists()
+        })
 }
 
-async fn should_skip_download_async(data_dir: &Path, row: &VideoRow, force: bool) -> bool {
-    !force
-        && row.downloaded_at.is_some()
-        && async_path_exists(data_dir, row.audio_path.as_deref()).await
+async fn should_skip_download_async(
+    data_dir: &Path,
+    row: &VideoRow,
+    audio_format: &str,
+    force: bool,
+) -> bool {
+    if force || row.downloaded_at.is_none() {
+        return false;
+    }
+
+    let Some(path) = row.audio_path.as_deref() else {
+        return false;
+    };
+    audio_path_matches_format(path, audio_format)
+        && fs::try_exists(ledger_path_to_fs_path(data_dir, path))
+            .await
+            .unwrap_or(false)
+}
+
+fn audio_path_matches_format(path: &str, audio_format: &str) -> bool {
+    let audio_format = audio_format.trim_start_matches('.');
+    !audio_format.is_empty()
+        && (audio_format.eq_ignore_ascii_case("best")
+            || Path::new(path)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case(audio_format)))
 }
 
 #[cfg(test)]
@@ -1137,7 +1160,7 @@ async fn async_path_exists(data_dir: &Path, path: Option<&str>) -> bool {
 async fn download_state(data_dir: &Path, row: &VideoRow) -> &'static str {
     if row.downloaded_at.is_none() {
         "-"
-    } else if should_skip_download_async(data_dir, row, false).await {
+    } else if async_path_exists(data_dir, row.audio_path.as_deref()).await {
         "done"
     } else {
         "missing"
@@ -2285,19 +2308,21 @@ mod tests {
         ledger.ensure_video(video_id, &canonical_video_url(video_id))?;
 
         let mut row = row_for_skip_tests();
-        assert!(!should_skip_download(dir.path(), &row, false));
+        assert!(!should_skip_download(dir.path(), &row, "m4a", false));
 
         let missing_audio = dir.path().join("missing.m4a");
         ledger.mark_downloaded(video_id, &missing_audio)?;
         row = ledger.row(video_id)?.expect("row exists");
-        assert!(!should_skip_download(dir.path(), &row, false));
+        assert!(!should_skip_download(dir.path(), &row, "m4a", false));
 
         let audio = dir.path().join("audio.m4a");
         std::fs::write(&audio, b"audio")?;
         ledger.mark_downloaded(video_id, &audio)?;
         row = ledger.row(video_id)?.expect("row exists");
-        assert!(should_skip_download(dir.path(), &row, false));
-        assert!(!should_skip_download(dir.path(), &row, true));
+        assert!(should_skip_download(dir.path(), &row, "m4a", false));
+        assert!(should_skip_download(dir.path(), &row, "M4A", false));
+        assert!(!should_skip_download(dir.path(), &row, "opus", false));
+        assert!(!should_skip_download(dir.path(), &row, "m4a", true));
 
         let transcript_json = dir.path().join("transcript.json");
         std::fs::write(&transcript_json, b"{}")?;
