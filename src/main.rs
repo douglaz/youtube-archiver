@@ -1864,10 +1864,19 @@ async fn find_whisper_outputs(tmp_dir: &Path, preferred_stem: &str) -> Result<(P
     }
 
     for (stem, json, txt) in &candidates {
-        if stem == preferred_stem
-            && let (Some(json), Some(txt)) = (json, txt)
-        {
-            return Ok((json.clone(), txt.clone()));
+        if stem == preferred_stem {
+            return match (json, txt) {
+                (Some(json), Some(txt)) => Ok((json.clone(), txt.clone())),
+                (Some(_), None) => bail!(
+                    "whisper produced {preferred_stem}.json without matching {preferred_stem}.txt in {}",
+                    tmp_dir.display()
+                ),
+                (None, Some(_)) => bail!(
+                    "whisper produced {preferred_stem}.txt without matching {preferred_stem}.json in {}",
+                    tmp_dir.display()
+                ),
+                (None, None) => unreachable!("preferred stem candidate has no transcript files"),
+            };
         }
     }
 
@@ -2593,6 +2602,21 @@ mod tests {
             .expect_err("ambiguous transcript pairs should fail");
 
         assert!(format!("{err:#}").contains("produced 2 transcript pairs"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn whisper_output_pair_rejects_incomplete_preferred_stem() -> Result<()> {
+        let dir = tempdir()?;
+        fs::write(dir.path().join("audio.json"), b"{}").await?;
+        fs::write(dir.path().join("fallback.json"), b"{}").await?;
+        fs::write(dir.path().join("fallback.txt"), b"fallback").await?;
+
+        let err = find_whisper_outputs(dir.path(), "audio")
+            .await
+            .expect_err("incomplete preferred transcript pair should fail");
+
+        assert!(format!("{err:#}").contains("without matching audio.txt"));
         Ok(())
     }
 
