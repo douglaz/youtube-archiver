@@ -27,6 +27,7 @@ const DEFAULT_WHISPER_BIN: &str = "nix run nixpkgs#openai-whisper --";
 const DEFAULT_WHISPER_MODEL: &str = "large";
 const DEFAULT_AUDIO_FORMAT: &str = "m4a";
 const STREAMED_STDERR_CAPTURE_LIMIT: usize = 64 * 1024;
+const YOUTUBE_VIDEO_ID_LEN: usize = 11;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static SLUG_RE: LazyLock<Regex> =
@@ -562,6 +563,10 @@ async fn resolve_video_ids(
     let args = resolve_video_ids_args(url, mode, limit);
     let output = run_checked("yt-dlp", &args).await?;
     let stdout = String::from_utf8(output.stdout).context("yt-dlp emitted non-UTF8 video IDs")?;
+    Ok(collect_valid_resolved_video_ids(&stdout, limit))
+}
+
+fn collect_valid_resolved_video_ids(stdout: &str, limit: Option<usize>) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut ids = Vec::new();
 
@@ -570,6 +575,13 @@ async fn resolve_video_ids(
         .map(str::trim)
         .filter(|line| !line.is_empty())
     {
+        if !is_valid_youtube_video_id(line) {
+            warn!(
+                error = %invalid_video_id_error(line),
+                "skipping invalid video ID returned by yt-dlp"
+            );
+            continue;
+        }
         if seen.insert(line.to_owned()) {
             ids.push(line.to_owned());
         }
@@ -578,7 +590,18 @@ async fn resolve_video_ids(
         }
     }
 
-    Ok(ids)
+    ids
+}
+
+fn is_valid_youtube_video_id(video_id: &str) -> bool {
+    video_id.len() == YOUTUBE_VIDEO_ID_LEN
+        && video_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn invalid_video_id_error(video_id: &str) -> String {
+    format!("invalid YouTube video ID {video_id:?}; expected [A-Za-z0-9_-]{{11}}")
 }
 
 fn resolve_video_ids_args(url: &str, mode: InputMode, limit: Option<usize>) -> Vec<String> {
@@ -1925,6 +1948,35 @@ mod tests {
                 "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PL123"
             ]
         );
+    }
+
+    #[test]
+    fn collect_resolved_video_ids_rejects_malformed_ids() {
+        let ids = collect_valid_resolved_video_ids(
+            concat!(
+                "dQw4w9WgXcQ\n",
+                "../escape\n",
+                "abc/defghij\n",
+                "abc\0defghij\n",
+                "too-short\n",
+                "too-long-id12\n",
+                "abc1234567_\n"
+            ),
+            None,
+        );
+
+        assert_eq!(ids, ["dQw4w9WgXcQ", "abc1234567_"]);
+        assert!(!is_valid_youtube_video_id("../escape"));
+        assert!(!is_valid_youtube_video_id("abc/defghij"));
+        assert!(!is_valid_youtube_video_id("abc\0defghij"));
+    }
+
+    #[test]
+    fn collect_resolved_video_ids_does_not_count_invalid_ids_toward_limit() {
+        let ids =
+            collect_valid_resolved_video_ids("../escape\ndQw4w9WgXcQ\nabc1234567_\n", Some(1));
+
+        assert_eq!(ids, ["dQw4w9WgXcQ"]);
     }
 
     #[test]
