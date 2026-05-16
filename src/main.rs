@@ -758,13 +758,17 @@ async fn emit_wiki_article(
     metadata: &VideoMetadata,
     force: bool,
 ) -> Result<PathBuf> {
+    let wiki_path = wiki_path_for_metadata(data_dir, metadata);
     let previous_wiki_path = if let Some(row) = ledger.row(&metadata.video_id)? {
         if should_skip_wiki_async(&row, force).await {
-            return Ok(PathBuf::from(
-                row.wiki_path.expect("checked by should_skip_wiki_async"),
-            ));
+            let row_wiki_path = row.wiki_path.expect("checked by should_skip_wiki_async");
+            if ledger_path_matches(&row_wiki_path, &wiki_path)? {
+                return Ok(PathBuf::from(row_wiki_path));
+            }
+            Some(row_wiki_path)
+        } else {
+            row.wiki_path
         }
-        row.wiki_path
     } else {
         None
     };
@@ -777,6 +781,14 @@ async fn emit_wiki_article(
         .await
         .with_context(|| format!("read {}", transcript_txt.display()))?;
 
+    let article = render_wiki_markdown(metadata, &transcript)?;
+    atomic_write(&wiki_path, article.as_bytes()).await?;
+    remove_stale_wiki_article(previous_wiki_path.as_deref(), &wiki_path).await?;
+    ledger.mark_wiki_emitted(&metadata.video_id, &wiki_path)?;
+    Ok(wiki_path)
+}
+
+fn wiki_path_for_metadata(data_dir: &Path, metadata: &VideoMetadata) -> PathBuf {
     let channel_slug = slugify(
         metadata
             .channel_title
@@ -785,15 +797,14 @@ async fn emit_wiki_article(
             .or(metadata.channel_id.as_deref())
             .unwrap_or("unknown-channel"),
     );
-    let wiki_path = data_dir
+    data_dir
         .join("wiki")
         .join(channel_slug)
-        .join(format!("{}.md", metadata.video_id));
-    let article = render_wiki_markdown(metadata, &transcript)?;
-    atomic_write(&wiki_path, article.as_bytes()).await?;
-    remove_stale_wiki_article(previous_wiki_path.as_deref(), &wiki_path).await?;
-    ledger.mark_wiki_emitted(&metadata.video_id, &wiki_path)?;
-    Ok(wiki_path)
+        .join(format!("{}.md", metadata.video_id))
+}
+
+fn ledger_path_matches(ledger_path: &str, path: &Path) -> Result<bool> {
+    Ok(path_to_ledger_string(Path::new(ledger_path))? == path_to_ledger_string(path)?)
 }
 
 fn status(args: DataDirArgs) -> Result<()> {
@@ -1943,6 +1954,52 @@ mod tests {
 
         remove_stale_wiki_article(Some(&path_to_string(&old_wiki)), &new_wiki).await?;
 
+        assert!(!fs::try_exists(&old_wiki).await?);
+        assert!(fs::try_exists(&new_wiki).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn emit_wiki_article_reemits_when_channel_slug_changes() -> Result<()> {
+        let dir = tempdir()?;
+        let ledger = Ledger::open(dir.path())?;
+        let video_id = "abc123";
+        let transcript_txt = dir
+            .path()
+            .join("transcripts")
+            .join(video_id)
+            .join("transcript.txt");
+        let old_wiki = dir
+            .path()
+            .join("wiki")
+            .join("old-channel")
+            .join(format!("{video_id}.md"));
+        atomic_write(&transcript_txt, b"hello transcript").await?;
+        atomic_write(&old_wiki, b"old article").await?;
+        ledger.ensure_video(video_id, &canonical_video_url(video_id))?;
+        ledger.mark_wiki_emitted(video_id, &old_wiki)?;
+
+        let metadata = VideoMetadata {
+            video_id: video_id.to_owned(),
+            url: canonical_video_url(video_id),
+            channel_id: None,
+            channel_title: Some("New Channel".to_owned()),
+            uploader: None,
+            title: Some("Title".to_owned()),
+            upload_date: None,
+            duration: None,
+            tags: Vec::new(),
+        };
+
+        let new_wiki = emit_wiki_article(dir.path(), &ledger, &metadata, false).await?;
+
+        assert_eq!(
+            new_wiki,
+            dir.path()
+                .join("wiki")
+                .join("new-channel")
+                .join(format!("{video_id}.md"))
+        );
         assert!(!fs::try_exists(&old_wiki).await?);
         assert!(fs::try_exists(&new_wiki).await?);
         Ok(())
