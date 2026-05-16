@@ -1035,6 +1035,8 @@ fn classify_youtube_url(url: &str) -> InputMode {
         || (path_has_segment(&path, "watch") && query_param_has_value(query, "v"))
         || path_has_segment(&path, "shorts")
         || path_has_segment(&path, "embed")
+        || path_has_segment(&path, "v")
+        || path_has_segment(&path, "e")
     {
         InputMode::Video
     } else if path_has_segment(&path, "playlist") || query_param_has_value(query, "list") {
@@ -2146,6 +2148,14 @@ mod tests {
         );
         assert_eq!(
             classify_youtube_url("https://www.youtube.com/shorts/dQw4w9WgXcQ"),
+            InputMode::Video
+        );
+        assert_eq!(
+            classify_youtube_url("https://www.youtube.com/v/dQw4w9WgXcQ"),
+            InputMode::Video
+        );
+        assert_eq!(
+            classify_youtube_url("https://www.youtube.com/e/dQw4w9WgXcQ"),
             InputMode::Video
         );
         assert_eq!(
