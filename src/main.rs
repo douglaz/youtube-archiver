@@ -756,7 +756,7 @@ async fn download_audio(
     ];
 
     let result: Result<PathBuf> = async {
-        run_checked_stream_stderr("yt-dlp", &args).await?;
+        run_checked_stream_output("yt-dlp", &args).await?;
         let downloaded = find_audio_file(&tmp_dir, audio_format).await?;
         let extension = downloaded
             .extension()
@@ -832,7 +832,7 @@ async fn transcribe_audio(
 
     ledger.mark_transcription_started(video_id)?;
     let result: Result<PathBuf> = async {
-        run_checked_stream_stderr(&program, &args).await?;
+        run_checked_stream_output(&program, &args).await?;
         let output_stem = audio_path
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -1314,7 +1314,7 @@ async fn run_checked(program: &str, args: &[String]) -> Result<Output> {
     ensure_success(program, args, output)
 }
 
-async fn run_checked_stream_stderr(program: &str, args: &[String]) -> Result<Output> {
+async fn run_checked_stream_output(program: &str, args: &[String]) -> Result<Output> {
     let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
@@ -1417,11 +1417,16 @@ fn push_captured_output(captured: &mut Vec<u8>, chunk: &[u8]) -> bool {
 }
 
 fn add_truncation_notice(captured: &mut Vec<u8>, stream_name: &str) {
-    let mut prefixed =
+    let mut notice =
         format!("[{stream_name} truncated to last {STREAMED_OUTPUT_CAPTURE_LIMIT} bytes]\n")
             .into_bytes();
-    prefixed.append(captured);
-    *captured = prefixed;
+    let payload_limit = STREAMED_OUTPUT_CAPTURE_LIMIT.saturating_sub(notice.len());
+    if captured.len() > payload_limit {
+        let excess = captured.len() - payload_limit;
+        captured.drain(..excess);
+    }
+    notice.append(captured);
+    *captured = notice;
 }
 
 fn ensure_success(program: &str, args: &[String], output: Output) -> Result<Output> {
@@ -2658,6 +2663,16 @@ mod tests {
         assert!(push_captured_output(&mut captured, b"bcde"));
         assert_eq!(captured.len(), STREAMED_OUTPUT_CAPTURE_LIMIT);
         assert_eq!(&captured[STREAMED_OUTPUT_CAPTURE_LIMIT - 4..], b"bcde");
+    }
+
+    #[test]
+    fn truncation_notice_keeps_capture_within_limit() {
+        let mut captured = vec![b'a'; STREAMED_OUTPUT_CAPTURE_LIMIT];
+
+        add_truncation_notice(&mut captured, "stdout");
+
+        assert!(captured.starts_with(b"[stdout truncated to last "));
+        assert_eq!(captured.len(), STREAMED_OUTPUT_CAPTURE_LIMIT);
     }
 
     #[tokio::test]
