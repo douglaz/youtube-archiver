@@ -607,6 +607,7 @@ fn resolve_video_ids_args(url: &str, mode: InputMode, limit: Option<usize>) -> V
     if let Some(limit) = limit {
         args.extend(["--playlist-end".to_owned(), limit.to_string()]);
     }
+    args.push("--".to_owned());
     args.push(url.to_owned());
     args
 }
@@ -1930,6 +1931,7 @@ mod tests {
                 "id",
                 "--playlist-end",
                 "3",
+                "--",
                 "https://www.youtube.com/playlist?list=PL123"
             ]
         );
@@ -1948,6 +1950,7 @@ mod tests {
                 "--print",
                 "id",
                 "--no-playlist",
+                "--",
                 "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PL123"
             ]
         );
