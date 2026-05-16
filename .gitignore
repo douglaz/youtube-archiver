@@ -1,0 +1,7 @@
+/target
+/data
+**/*.rs.bk
+.direnv/
+result
+result-*
+.envrc.local
