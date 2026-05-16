@@ -825,7 +825,7 @@ async fn emit_wiki_article(
         .await
         .with_context(|| format!("read {}", transcript_txt.display()))?;
 
-    let article = render_wiki_markdown(metadata, &transcript)?;
+    let article = render_wiki_markdown(metadata, &transcript);
     atomic_write(&wiki_path, article.as_bytes()).await?;
     remove_stale_wiki_article(data_dir, previous_wiki_path.as_deref(), &wiki_path).await?;
     ledger.mark_wiki_emitted(&metadata.video_id, &wiki_path)?;
@@ -1024,7 +1024,7 @@ fn tags_field(value: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn render_wiki_markdown(metadata: &VideoMetadata, transcript: &str) -> Result<String> {
+fn render_wiki_markdown(metadata: &VideoMetadata, transcript: &str) -> String {
     let title = metadata.title.as_deref().unwrap_or(&metadata.video_id);
     let channel = metadata
         .channel_title
@@ -1062,7 +1062,7 @@ fn render_wiki_markdown(metadata: &VideoMetadata, transcript: &str) -> Result<St
     output.push_str("---\n\n");
     output.push_str(transcript.trim());
     output.push('\n');
-    Ok(output)
+    output
 }
 
 fn yaml_string(value: &str) -> String {
@@ -2045,7 +2045,7 @@ mod tests {
             tags: vec!["rust".to_owned(), "cli tools".to_owned()],
         };
 
-        let markdown = render_wiki_markdown(&metadata, "hello transcript\n")?;
+        let markdown = render_wiki_markdown(&metadata, "hello transcript\n");
 
         assert!(markdown.starts_with("---\n"));
         assert!(markdown.contains("title: \"A \\\"quoted\\\" title\"\n"));
@@ -2074,7 +2074,9 @@ mod tests {
             tags: Vec::new(),
         };
 
-        let markdown = render_wiki_markdown(&metadata, "hello")?;
+        let markdown = render_wiki_markdown(&metadata, "hello");
+        assert!(markdown.contains("upload_date: null\n"));
+        assert!(markdown.contains("duration: null\n"));
 
         assert!(markdown.contains("channel: \"UC123\"\n"));
         assert!(markdown.contains("uploader: \"UC123\"\n"));
