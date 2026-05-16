@@ -1230,6 +1230,7 @@ async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
             .await
             .with_context(|| format!("create {}", parent.display()))?;
     }
+    cleanup_stale_temp_files_for(path).await?;
 
     let tmp_path = temp_path_for(path)?;
     let mut file = fs::File::create(&tmp_path)
@@ -1435,7 +1436,7 @@ async fn cleanup_stage_temp_dirs_linux(parent: &Path, prefix: &str) -> Result<()
         let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if should_remove_stage_temp_dir(file_name, prefix) {
+        if should_remove_stage_temp_path(file_name, prefix) {
             fs::remove_dir_all(&path)
                 .await
                 .with_context(|| format!("remove stale temp dir {}", path.display()))?;
@@ -1446,15 +1447,65 @@ async fn cleanup_stage_temp_dirs_linux(parent: &Path, prefix: &str) -> Result<()
 }
 
 #[cfg(target_os = "linux")]
-fn should_remove_stage_temp_dir(file_name: &str, prefix: &str) -> bool {
-    let Some(pid) = stage_temp_dir_pid(file_name, prefix) else {
+async fn cleanup_stale_temp_files_for(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no parent directory", path.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("{} has no file name", path.display()))?;
+    cleanup_stale_temp_files(parent, &format!(".{file_name}")).await
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn cleanup_stale_temp_files_for(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn cleanup_stale_temp_files(parent: &Path, prefix: &str) -> Result<()> {
+    let mut entries = fs::read_dir(parent)
+        .await
+        .with_context(|| format!("read {}", parent.display()))?;
+
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .with_context(|| format!("read entry in {}", parent.display()))?
+    {
+        let path = entry.path();
+        if !entry
+            .file_type()
+            .await
+            .with_context(|| format!("stat {}", path.display()))?
+            .is_file()
+        {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if should_remove_stage_temp_path(file_name, prefix) {
+            fs::remove_file(&path)
+                .await
+                .with_context(|| format!("remove stale temp file {}", path.display()))?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn should_remove_stage_temp_path(file_name: &str, prefix: &str) -> bool {
+    let Some(pid) = stage_temp_path_pid(file_name, prefix) else {
         return false;
     };
     pid == std::process::id() || !process_exists(pid)
 }
 
 #[cfg(target_os = "linux")]
-fn stage_temp_dir_pid(file_name: &str, prefix: &str) -> Option<u32> {
+fn stage_temp_path_pid(file_name: &str, prefix: &str) -> Option<u32> {
     let rest = file_name.strip_prefix(prefix)?.strip_prefix('.')?;
     let rest = rest.strip_suffix(".tmp")?;
     let mut parts = rest.split('.');
@@ -1528,6 +1579,9 @@ async fn replace_transcript_pair(
     final_json: &Path,
     final_txt: &Path,
 ) -> Result<()> {
+    cleanup_stale_temp_files_for(final_json).await?;
+    cleanup_stale_temp_files_for(final_txt).await?;
+
     let backup_json = temp_path_for(final_json)?;
     let backup_txt = temp_path_for(final_txt)?;
     let mut backed_up_json = false;
@@ -2053,6 +2107,23 @@ mod tests {
 
         assert!(!fs::try_exists(&old_wiki).await?);
         assert!(fs::try_exists(&new_wiki).await?);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn atomic_write_removes_stale_temp_files() -> Result<()> {
+        let dir = tempdir()?;
+        let target = dir.path().join("info.json");
+        let stale = dir
+            .path()
+            .join(format!(".info.json.{}.1.0.tmp", std::process::id()));
+        fs::write(&stale, b"stale").await?;
+
+        atomic_write(&target, b"fresh").await?;
+
+        assert!(!fs::try_exists(&stale).await?);
+        assert_eq!(fs::read(&target).await?, b"fresh");
         Ok(())
     }
 
