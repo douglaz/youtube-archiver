@@ -463,7 +463,7 @@ async fn main() -> Result<()> {
 
     match Cli::parse().command {
         Commands::Ingest(args) => ingest(args).await,
-        Commands::Status(args) => status(args),
+        Commands::Status(args) => status(args).await,
         Commands::List(args) => list(args),
     }
 }
@@ -832,7 +832,7 @@ fn ledger_path_matches(data_dir: &Path, ledger_path: &str, path: &Path) -> Resul
         == path_to_ledger_string(data_dir, path)?)
 }
 
-fn status(args: DataDirArgs) -> Result<()> {
+async fn status(args: DataDirArgs) -> Result<()> {
     let rows = Ledger::open_read_only(&args.data_dir)?
         .map(|ledger| ledger.rows())
         .transpose()?
@@ -843,12 +843,15 @@ fn status(args: DataDirArgs) -> Result<()> {
         "video_id", "download", "transcribe", "wiki", "error"
     );
     for row in rows {
+        let download = download_state(&args.data_dir, &row).await;
+        let transcript = transcript_state(&args.data_dir, &row).await;
+        let wiki = wiki_state(&args.data_dir, &row).await;
         println!(
             "{:<14} {:<10} {:<11} {:<10} {:<7} {}",
             row.video_id,
-            download_state(&args.data_dir, &row),
-            transcript_state(&args.data_dir, &row),
-            wiki_state(&args.data_dir, &row),
+            download,
+            transcript,
+            wiki,
             if row.error.is_some() { "yes" } else { "-" },
             row.title.as_deref().unwrap_or("-")
         );
@@ -1046,6 +1049,7 @@ fn slugify(value: &str) -> String {
     }
 }
 
+#[cfg(test)]
 fn should_skip_download(data_dir: &Path, row: &VideoRow, force: bool) -> bool {
     !force
         && row.downloaded_at.is_some()
@@ -1061,6 +1065,7 @@ async fn should_skip_download_async(data_dir: &Path, row: &VideoRow, force: bool
         && async_path_exists(data_dir, row.audio_path.as_deref()).await
 }
 
+#[cfg(test)]
 fn should_skip_transcription(
     data_dir: &Path,
     row: &VideoRow,
@@ -1099,6 +1104,7 @@ async fn should_skip_transcription_async(
         && fs::try_exists(txt_path).await.unwrap_or(false)
 }
 
+#[cfg(test)]
 fn should_skip_wiki(data_dir: &Path, row: &VideoRow, force: bool) -> bool {
     !force
         && row.wiki_emitted_at.is_some()
@@ -1123,35 +1129,37 @@ async fn async_path_exists(data_dir: &Path, path: Option<&str>) -> bool {
     }
 }
 
-fn download_state(data_dir: &Path, row: &VideoRow) -> &'static str {
+async fn download_state(data_dir: &Path, row: &VideoRow) -> &'static str {
     if row.downloaded_at.is_none() {
         "-"
-    } else if should_skip_download(data_dir, row, false) {
+    } else if should_skip_download_async(data_dir, row, false).await {
         "done"
     } else {
         "missing"
     }
 }
 
-fn wiki_state(data_dir: &Path, row: &VideoRow) -> &'static str {
+async fn wiki_state(data_dir: &Path, row: &VideoRow) -> &'static str {
     if row.wiki_emitted_at.is_none() {
         "-"
-    } else if should_skip_wiki(data_dir, row, false) {
+    } else if should_skip_wiki_async(data_dir, row, false).await {
         "done"
     } else {
         "missing"
     }
 }
 
-fn transcript_state(data_dir: &Path, row: &VideoRow) -> &'static str {
+async fn transcript_state(data_dir: &Path, row: &VideoRow) -> &'static str {
     if row.transcribed_at.is_none() {
         "-"
-    } else if should_skip_transcription(
+    } else if should_skip_transcription_async(
         data_dir,
         row,
         row.whisper_model.as_deref().unwrap_or(""),
         false,
-    ) {
+    )
+    .await
+    {
         "done"
     } else {
         "missing"
