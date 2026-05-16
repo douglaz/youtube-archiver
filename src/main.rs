@@ -28,6 +28,8 @@ const DEFAULT_WHISPER_MODEL: &str = "large";
 const DEFAULT_AUDIO_FORMAT: &str = "m4a";
 const STREAMED_STDERR_CAPTURE_LIMIT: usize = 64 * 1024;
 const YOUTUBE_VIDEO_ID_LEN: usize = 11;
+#[cfg(not(target_os = "linux"))]
+const NON_LINUX_STALE_TEMP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static SLUG_RE: LazyLock<Regex> =
@@ -1570,24 +1572,6 @@ async fn remove_stale_wiki_article(
 }
 
 async fn cleanup_stage_temp_dirs(parent: &Path, prefix: &str) -> Result<()> {
-    #[cfg(not(target_os = "linux"))]
-    {
-        tracing::debug!(
-            path = %parent.display(),
-            prefix,
-            "stale temp cleanup is only enabled on Linux"
-        );
-        return Ok(());
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        cleanup_stage_temp_dirs_linux(parent, prefix).await
-    }
-}
-
-#[cfg(target_os = "linux")]
-async fn cleanup_stage_temp_dirs_linux(parent: &Path, prefix: &str) -> Result<()> {
     let mut entries = fs::read_dir(parent)
         .await
         .with_context(|| format!("read {}", parent.display()))?;
@@ -1609,7 +1593,7 @@ async fn cleanup_stage_temp_dirs_linux(parent: &Path, prefix: &str) -> Result<()
         let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if should_remove_stage_temp_path(file_name, prefix) {
+        if should_remove_stage_temp_path(&path, file_name, prefix).await? {
             fs::remove_dir_all(&path)
                 .await
                 .with_context(|| format!("remove stale temp dir {}", path.display()))?;
@@ -1619,7 +1603,6 @@ async fn cleanup_stage_temp_dirs_linux(parent: &Path, prefix: &str) -> Result<()
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
 async fn cleanup_stale_temp_files_for(path: &Path) -> Result<()> {
     let parent = path
         .parent()
@@ -1631,12 +1614,6 @@ async fn cleanup_stale_temp_files_for(path: &Path) -> Result<()> {
     cleanup_stale_temp_files(parent, &format!(".{file_name}")).await
 }
 
-#[cfg(not(target_os = "linux"))]
-async fn cleanup_stale_temp_files_for(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
 async fn cleanup_stale_temp_files(parent: &Path, prefix: &str) -> Result<()> {
     let mut entries = fs::read_dir(parent)
         .await
@@ -1659,7 +1636,7 @@ async fn cleanup_stale_temp_files(parent: &Path, prefix: &str) -> Result<()> {
         let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if should_remove_stage_temp_path(file_name, prefix) {
+        if should_remove_stage_temp_path(&path, file_name, prefix).await? {
             fs::remove_file(&path)
                 .await
                 .with_context(|| format!("remove stale temp file {}", path.display()))?;
@@ -1669,15 +1646,17 @@ async fn cleanup_stale_temp_files(parent: &Path, prefix: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-fn should_remove_stage_temp_path(file_name: &str, prefix: &str) -> bool {
+async fn should_remove_stage_temp_path(path: &Path, file_name: &str, prefix: &str) -> Result<bool> {
     let Some(pid) = stage_temp_path_pid(file_name, prefix) else {
-        return false;
+        return Ok(false);
     };
-    pid == std::process::id() || !process_exists(pid)
+    if pid == std::process::id() {
+        return Ok(true);
+    }
+
+    should_remove_stage_temp_path_for_pid(path, pid).await
 }
 
-#[cfg(target_os = "linux")]
 fn stage_temp_path_pid(file_name: &str, prefix: &str) -> Option<u32> {
     let rest = file_name.strip_prefix(prefix)?.strip_prefix('.')?;
     let rest = rest.strip_suffix(".tmp")?;
@@ -1694,7 +1673,26 @@ fn stage_temp_path_pid(file_name: &str, prefix: &str) -> Option<u32> {
 }
 
 #[cfg(target_os = "linux")]
+async fn should_remove_stage_temp_path_for_pid(_path: &Path, pid: u32) -> Result<bool> {
+    Ok(!process_exists(pid))
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn should_remove_stage_temp_path_for_pid(path: &Path, _pid: u32) -> Result<bool> {
+    let metadata = fs::metadata(path)
+        .await
+        .with_context(|| format!("stat temp path {}", path.display()))?;
+    Ok(metadata
+        .modified()
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|age| age >= NON_LINUX_STALE_TEMP_AGE))
+}
+
+#[cfg(target_os = "linux")]
 fn process_exists(pid: u32) -> bool {
+    // This is a best-effort liveness check: PID reuse can make an unrelated
+    // process look active, in which case the stale temp path is kept.
     Path::new("/proc").join(pid.to_string()).exists()
 }
 
