@@ -418,11 +418,18 @@ impl Ledger {
                 "#,
             )
             .context("prepare ledger list query")?;
-        let rows = stmt
+        let mut query_rows = stmt
             .query_map([], row_from_sql)
-            .context("query ledger rows")?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .context("read ledger rows")?;
+            .context("query ledger rows")?;
+        let mut rows = Vec::new();
+        for row in &mut query_rows {
+            match row {
+                Ok(row) => rows.push(row),
+                Err(err) => {
+                    warn!(error = %err, "skipping corrupt ledger row");
+                }
+            }
+        }
         Ok(rows)
     }
 }
@@ -1809,6 +1816,26 @@ mod tests {
         let err = ledger.row("abc123").expect_err("corrupt tags should fail");
 
         assert!(format!("{err:#}").contains("expected ident"));
+        Ok(())
+    }
+
+    #[test]
+    fn ledger_rows_skip_corrupt_tags_json() -> Result<()> {
+        let ledger = Ledger::open_in_memory()?;
+        ledger.conn.execute(
+            "INSERT INTO videos (video_id, url, tags) VALUES (?1, ?2, ?3)",
+            params!["bad", canonical_video_url("bad"), "not json"],
+        )?;
+        ledger.conn.execute(
+            "INSERT INTO videos (video_id, url, title, tags) VALUES (?1, ?2, ?3, ?4)",
+            params!["good", canonical_video_url("good"), "Good", "[\"rust\"]"],
+        )?;
+
+        let rows = ledger.rows()?;
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].video_id, "good");
+        assert_eq!(rows[0].tags, vec!["rust".to_owned()]);
         Ok(())
     }
 
