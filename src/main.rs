@@ -1178,7 +1178,7 @@ fn should_skip_download(data_dir: &Path, row: &VideoRow, audio_format: &str, for
         && row.downloaded_at.is_some()
         && row.audio_path.as_deref().is_some_and(|path| {
             audio_path_matches_format(path, audio_format)
-                && ledger_path_to_fs_path(data_dir, path).exists()
+                && ledger_path_to_fs_path(data_dir, path).is_file()
         })
 }
 
@@ -1196,9 +1196,7 @@ async fn should_skip_download_async(
         return false;
     };
     audio_path_matches_format(path, audio_format)
-        && fs::try_exists(ledger_path_to_fs_path(data_dir, path))
-            .await
-            .unwrap_or(false)
+        && async_fs_path_is_file(ledger_path_to_fs_path(data_dir, path)).await
 }
 
 fn audio_path_matches_format(path: &str, audio_format: &str) -> bool {
@@ -1226,7 +1224,7 @@ fn should_skip_transcription(
     row.transcript_path.as_deref().is_some_and(|path| {
         let json_path = ledger_path_to_fs_path(data_dir, path);
         let txt_path = json_path.with_file_name("transcript.txt");
-        json_path.exists() && txt_path.exists()
+        json_path.is_file() && txt_path.is_file()
     })
 }
 
@@ -1246,8 +1244,7 @@ async fn should_skip_transcription_async(
     };
     let json_path = ledger_path_to_fs_path(data_dir, path);
     let txt_path = json_path.with_file_name("transcript.txt");
-    fs::try_exists(json_path).await.unwrap_or(false)
-        && fs::try_exists(txt_path).await.unwrap_or(false)
+    async_fs_path_is_file(json_path).await && async_fs_path_is_file(txt_path).await
 }
 
 #[cfg(test)]
@@ -1257,28 +1254,33 @@ fn should_skip_wiki(data_dir: &Path, row: &VideoRow, force: bool) -> bool {
         && row
             .wiki_path
             .as_deref()
-            .is_some_and(|path| ledger_path_to_fs_path(data_dir, path).exists())
+            .is_some_and(|path| ledger_path_to_fs_path(data_dir, path).is_file())
 }
 
 async fn should_skip_wiki_async(data_dir: &Path, row: &VideoRow, force: bool) -> bool {
     !force
         && row.wiki_emitted_at.is_some()
-        && async_path_exists(data_dir, row.wiki_path.as_deref()).await
+        && async_ledger_path_is_file(data_dir, row.wiki_path.as_deref()).await
 }
 
-async fn async_path_exists(data_dir: &Path, path: Option<&str>) -> bool {
+async fn async_ledger_path_is_file(data_dir: &Path, path: Option<&str>) -> bool {
     match path {
-        Some(path) => fs::try_exists(ledger_path_to_fs_path(data_dir, path))
-            .await
-            .unwrap_or(false),
+        Some(path) => async_fs_path_is_file(ledger_path_to_fs_path(data_dir, path)).await,
         None => false,
+    }
+}
+
+async fn async_fs_path_is_file(path: PathBuf) -> bool {
+    match fs::metadata(path).await {
+        Ok(metadata) => metadata.is_file(),
+        Err(_) => false,
     }
 }
 
 async fn download_state(data_dir: &Path, row: &VideoRow) -> &'static str {
     if row.downloaded_at.is_none() {
         "-"
-    } else if async_path_exists(data_dir, row.audio_path.as_deref()).await {
+    } else if async_ledger_path_is_file(data_dir, row.audio_path.as_deref()).await {
         "done"
     } else {
         "missing"
@@ -2935,6 +2937,12 @@ mod tests {
         row = ledger.row(video_id)?.expect("row exists");
         assert!(!should_skip_download(dir.path(), &row, "m4a", false));
 
+        let audio_dir = dir.path().join("audio-dir.m4a");
+        std::fs::create_dir(&audio_dir)?;
+        ledger.mark_downloaded(video_id, &audio_dir)?;
+        row = ledger.row(video_id)?.expect("row exists");
+        assert!(!should_skip_download(dir.path(), &row, "m4a", false));
+
         let audio = dir.path().join("audio.m4a");
         std::fs::write(&audio, b"audio")?;
         ledger.mark_downloaded(video_id, &audio)?;
@@ -2950,12 +2958,30 @@ mod tests {
         row = ledger.row(video_id)?.expect("row exists");
         assert!(!should_skip_transcription(dir.path(), &row, "large", false));
 
+        let transcript_json_dir = dir.path().join("transcript-dir.json");
+        let transcript_txt_dir = dir.path().join("transcript.txt");
+        std::fs::create_dir(&transcript_json_dir)?;
+        std::fs::create_dir(&transcript_txt_dir)?;
+        ledger.mark_transcribed(video_id, "large", &transcript_json_dir)?;
+        row = ledger.row(video_id)?.expect("row exists");
+        assert!(!should_skip_transcription(dir.path(), &row, "large", false));
+        std::fs::remove_dir(&transcript_json_dir)?;
+        std::fs::remove_dir(&transcript_txt_dir)?;
+
         let transcript_txt = dir.path().join("transcript.txt");
         std::fs::write(&transcript_txt, b"text")?;
+        ledger.mark_transcribed(video_id, "large", &transcript_json)?;
         row = ledger.row(video_id)?.expect("row exists");
         assert!(should_skip_transcription(dir.path(), &row, "large", false));
         assert!(!should_skip_transcription(dir.path(), &row, "base", false));
         assert!(!should_skip_transcription(dir.path(), &row, "large", true));
+
+        let wiki_dir = dir.path().join("wiki-dir.md");
+        std::fs::create_dir(&wiki_dir)?;
+        ledger.mark_wiki_emitted(video_id, &wiki_dir)?;
+        row = ledger.row(video_id)?.expect("row exists");
+        assert!(!should_skip_wiki(dir.path(), &row, false));
+        std::fs::remove_dir(&wiki_dir)?;
 
         let wiki = dir.path().join("wiki.md");
         std::fs::write(&wiki, b"wiki")?;
