@@ -145,17 +145,19 @@ struct VideoRow {
 
 struct Ledger {
     conn: Connection,
+    data_dir: PathBuf,
 }
 
 impl Ledger {
     fn open(data_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(data_dir)
             .with_context(|| format!("create data dir {}", data_dir.display()))?;
+        let data_dir = data_dir.to_path_buf();
         let db_path = data_dir.join("state.sqlite");
         let conn = Connection::open(&db_path)
             .with_context(|| format!("open ledger {}", db_path.display()))?;
         configure_connection(&conn)?;
-        let ledger = Self { conn };
+        let ledger = Self { conn, data_dir };
         ledger.init()?;
         Ok(ledger)
     }
@@ -169,13 +171,19 @@ impl Ledger {
         let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("open ledger read-only {}", db_path.display()))?;
         configure_connection(&conn)?;
-        Ok(Some(Self { conn }))
+        Ok(Some(Self {
+            conn,
+            data_dir: data_dir.to_path_buf(),
+        }))
     }
 
     #[cfg(test)]
     fn open_in_memory() -> Result<Self> {
         let ledger = Self {
             conn: Connection::open_in_memory().context("open in-memory ledger")?,
+            data_dir: std::env::current_dir()
+                .context("read current directory for in-memory ledger")?
+                .join(DEFAULT_DATA_DIR),
         };
         configure_connection(&ledger.conn)?;
         ledger.init()?;
@@ -304,7 +312,7 @@ impl Ledger {
     }
 
     fn mark_downloaded(&self, video_id: &str, audio_path: &Path) -> Result<()> {
-        let audio_path = path_to_ledger_string(audio_path)?;
+        let audio_path = self.path_to_ledger_string(audio_path)?;
         self.conn
             .execute(
                 r#"
@@ -326,7 +334,7 @@ impl Ledger {
         whisper_model: &str,
         transcript_path: &Path,
     ) -> Result<()> {
-        let transcript_path = path_to_ledger_string(transcript_path)?;
+        let transcript_path = self.path_to_ledger_string(transcript_path)?;
         self.conn
             .execute(
                 r#"
@@ -360,7 +368,7 @@ impl Ledger {
     }
 
     fn mark_wiki_emitted(&self, video_id: &str, wiki_path: &Path) -> Result<()> {
-        let wiki_path = path_to_ledger_string(wiki_path)?;
+        let wiki_path = self.path_to_ledger_string(wiki_path)?;
         self.conn
             .execute(
                 r#"
@@ -431,6 +439,10 @@ impl Ledger {
             }
         }
         Ok(rows)
+    }
+
+    fn path_to_ledger_string(&self, path: &Path) -> Result<String> {
+        path_to_ledger_string(&self.data_dir, path)
     }
 }
 
@@ -618,12 +630,12 @@ async fn download_audio(
     force: bool,
 ) -> Result<PathBuf> {
     if let Some(row) = ledger.row(video_id)?
-        && should_skip_download_async(&row, force).await
+        && should_skip_download_async(data_dir, &row, force).await
     {
-        return Ok(PathBuf::from(
-            row.audio_path
-                .expect("checked by should_skip_download_async"),
-        ));
+        let audio_path = row
+            .audio_path
+            .expect("checked by should_skip_download_async");
+        return Ok(ledger_path_to_fs_path(data_dir, &audio_path));
     }
 
     let media_dir = data_dir.join("media").join(video_id);
@@ -693,12 +705,12 @@ async fn transcribe_audio(
     force: bool,
 ) -> Result<PathBuf> {
     if let Some(row) = ledger.row(video_id)?
-        && should_skip_transcription_async(&row, whisper.model, force).await
+        && should_skip_transcription_async(data_dir, &row, whisper.model, force).await
     {
-        return Ok(PathBuf::from(
-            row.transcript_path
-                .expect("checked by should_skip_transcription_async"),
-        ));
+        let transcript_path = row
+            .transcript_path
+            .expect("checked by should_skip_transcription_async");
+        return Ok(ledger_path_to_fs_path(data_dir, &transcript_path));
     }
 
     let transcript_dir = data_dir.join("transcripts").join(video_id);
@@ -767,10 +779,10 @@ async fn emit_wiki_article(
 ) -> Result<PathBuf> {
     let wiki_path = wiki_path_for_metadata(data_dir, metadata);
     let previous_wiki_path = if let Some(row) = ledger.row(&metadata.video_id)? {
-        if should_skip_wiki_async(&row, force).await {
+        if should_skip_wiki_async(data_dir, &row, force).await {
             let row_wiki_path = row.wiki_path.expect("checked by should_skip_wiki_async");
-            if ledger_path_matches(&row_wiki_path, &wiki_path)? {
-                return Ok(PathBuf::from(row_wiki_path));
+            if ledger_path_matches(data_dir, &row_wiki_path, &wiki_path)? {
+                return Ok(ledger_path_to_fs_path(data_dir, &row_wiki_path));
             }
             Some(row_wiki_path)
         } else {
@@ -790,7 +802,7 @@ async fn emit_wiki_article(
 
     let article = render_wiki_markdown(metadata, &transcript)?;
     atomic_write(&wiki_path, article.as_bytes()).await?;
-    remove_stale_wiki_article(previous_wiki_path.as_deref(), &wiki_path).await?;
+    remove_stale_wiki_article(data_dir, previous_wiki_path.as_deref(), &wiki_path).await?;
     ledger.mark_wiki_emitted(&metadata.video_id, &wiki_path)?;
     Ok(wiki_path)
 }
@@ -810,8 +822,9 @@ fn wiki_path_for_metadata(data_dir: &Path, metadata: &VideoMetadata) -> PathBuf 
         .join(format!("{}.md", metadata.video_id))
 }
 
-fn ledger_path_matches(ledger_path: &str, path: &Path) -> Result<bool> {
-    Ok(path_to_ledger_string(Path::new(ledger_path))? == path_to_ledger_string(path)?)
+fn ledger_path_matches(data_dir: &Path, ledger_path: &str, path: &Path) -> Result<bool> {
+    Ok(normalize_ledger_path_string(data_dir, ledger_path)?
+        == path_to_ledger_string(data_dir, path)?)
 }
 
 fn status(args: DataDirArgs) -> Result<()> {
@@ -828,9 +841,9 @@ fn status(args: DataDirArgs) -> Result<()> {
         println!(
             "{:<14} {:<10} {:<11} {:<10} {:<7} {}",
             row.video_id,
-            download_state(&row),
-            transcript_state(&row),
-            wiki_state(&row),
+            download_state(&args.data_dir, &row),
+            transcript_state(&args.data_dir, &row),
+            wiki_state(&args.data_dir, &row),
             if row.error.is_some() { "yes" } else { "-" },
             row.title.as_deref().unwrap_or("-")
         );
@@ -902,7 +915,9 @@ fn split_url_path_and_query(url: &str) -> (&str, Option<&str>) {
     let without_fragment = url.split_once('#').map_or(url, |(head, _)| head);
     without_fragment
         .split_once('?')
-        .map_or((without_fragment, None), |(path, query)| (path, Some(query)))
+        .map_or((without_fragment, None), |(path, query)| {
+            (path, Some(query))
+        })
 }
 
 fn path_has_segment(path: &str, segment: &str) -> bool {
@@ -1026,33 +1041,45 @@ fn slugify(value: &str) -> String {
     }
 }
 
-fn should_skip_download(row: &VideoRow, force: bool) -> bool {
+fn should_skip_download(data_dir: &Path, row: &VideoRow, force: bool) -> bool {
     !force
         && row.downloaded_at.is_some()
         && row
             .audio_path
             .as_deref()
-            .is_some_and(|path| Path::new(path).exists())
+            .is_some_and(|path| ledger_path_to_fs_path(data_dir, path).exists())
 }
 
-async fn should_skip_download_async(row: &VideoRow, force: bool) -> bool {
-    !force && row.downloaded_at.is_some() && async_path_exists(row.audio_path.as_deref()).await
+async fn should_skip_download_async(data_dir: &Path, row: &VideoRow, force: bool) -> bool {
+    !force
+        && row.downloaded_at.is_some()
+        && async_path_exists(data_dir, row.audio_path.as_deref()).await
 }
 
-fn should_skip_transcription(row: &VideoRow, whisper_model: &str, force: bool) -> bool {
+fn should_skip_transcription(
+    data_dir: &Path,
+    row: &VideoRow,
+    whisper_model: &str,
+    force: bool,
+) -> bool {
     if force || row.transcribed_at.is_none() || row.whisper_model.as_deref() != Some(whisper_model)
     {
         return false;
     }
 
     row.transcript_path.as_deref().is_some_and(|path| {
-        let json_path = Path::new(path);
+        let json_path = ledger_path_to_fs_path(data_dir, path);
         let txt_path = json_path.with_file_name("transcript.txt");
         json_path.exists() && txt_path.exists()
     })
 }
 
-async fn should_skip_transcription_async(row: &VideoRow, whisper_model: &str, force: bool) -> bool {
+async fn should_skip_transcription_async(
+    data_dir: &Path,
+    row: &VideoRow,
+    whisper_model: &str,
+    force: bool,
+) -> bool {
     if force || row.transcribed_at.is_none() || row.whisper_model.as_deref() != Some(whisper_model)
     {
         return false;
@@ -1061,56 +1088,65 @@ async fn should_skip_transcription_async(row: &VideoRow, whisper_model: &str, fo
     let Some(path) = row.transcript_path.as_deref() else {
         return false;
     };
-    let json_path = Path::new(path);
+    let json_path = ledger_path_to_fs_path(data_dir, path);
     let txt_path = json_path.with_file_name("transcript.txt");
     fs::try_exists(json_path).await.unwrap_or(false)
         && fs::try_exists(txt_path).await.unwrap_or(false)
 }
 
-fn should_skip_wiki(row: &VideoRow, force: bool) -> bool {
+fn should_skip_wiki(data_dir: &Path, row: &VideoRow, force: bool) -> bool {
     !force
         && row.wiki_emitted_at.is_some()
         && row
             .wiki_path
             .as_deref()
-            .is_some_and(|path| Path::new(path).exists())
+            .is_some_and(|path| ledger_path_to_fs_path(data_dir, path).exists())
 }
 
-async fn should_skip_wiki_async(row: &VideoRow, force: bool) -> bool {
-    !force && row.wiki_emitted_at.is_some() && async_path_exists(row.wiki_path.as_deref()).await
+async fn should_skip_wiki_async(data_dir: &Path, row: &VideoRow, force: bool) -> bool {
+    !force
+        && row.wiki_emitted_at.is_some()
+        && async_path_exists(data_dir, row.wiki_path.as_deref()).await
 }
 
-async fn async_path_exists(path: Option<&str>) -> bool {
+async fn async_path_exists(data_dir: &Path, path: Option<&str>) -> bool {
     match path {
-        Some(path) => fs::try_exists(path).await.unwrap_or(false),
+        Some(path) => fs::try_exists(ledger_path_to_fs_path(data_dir, path))
+            .await
+            .unwrap_or(false),
         None => false,
     }
 }
 
-fn download_state(row: &VideoRow) -> &'static str {
+fn download_state(data_dir: &Path, row: &VideoRow) -> &'static str {
     if row.downloaded_at.is_none() {
         "-"
-    } else if should_skip_download(row, false) {
+    } else if should_skip_download(data_dir, row, false) {
         "done"
     } else {
         "missing"
     }
 }
 
-fn wiki_state(row: &VideoRow) -> &'static str {
+fn wiki_state(data_dir: &Path, row: &VideoRow) -> &'static str {
     if row.wiki_emitted_at.is_none() {
         "-"
-    } else if should_skip_wiki(row, false) {
+    } else if should_skip_wiki(data_dir, row, false) {
         "done"
     } else {
         "missing"
     }
 }
 
-fn transcript_state(row: &VideoRow) -> &'static str {
+fn transcript_state(data_dir: &Path, row: &VideoRow) -> &'static str {
     if row.transcribed_at.is_none() {
         "-"
-    } else if should_skip_transcription(row, row.whisper_model.as_deref().unwrap_or(""), false) {
+    } else if should_skip_transcription(
+        data_dir,
+        row,
+        row.whisper_model.as_deref().unwrap_or(""),
+        false,
+    ) {
         "done"
     } else {
         "missing"
@@ -1165,7 +1201,9 @@ fn split_command_prefix(command: &str) -> Result<(String, Vec<String>)> {
 
 fn validate_whisper_args(args: &[String]) -> Result<()> {
     for arg in args {
-        let option = arg.split_once('=').map_or(arg.as_str(), |(option, _)| option);
+        let option = arg
+            .split_once('=')
+            .map_or(arg.as_str(), |(option, _)| option);
         if matches!(
             option,
             "--output_dir" | "--output-dir" | "--output_format" | "--output-format"
@@ -1316,17 +1354,21 @@ async fn remove_stale_audio_files(media_dir: &Path, keep_path: &Path) -> Result<
     Ok(())
 }
 
-async fn remove_stale_wiki_article(previous_path: Option<&str>, current_path: &Path) -> Result<()> {
+async fn remove_stale_wiki_article(
+    data_dir: &Path,
+    previous_path: Option<&str>,
+    current_path: &Path,
+) -> Result<()> {
     let Some(previous_path) = previous_path else {
         return Ok(());
     };
-    let previous_path = path_to_ledger_string(Path::new(previous_path))?;
-    let current_path = path_to_ledger_string(current_path)?;
+    let previous_path = normalize_ledger_path_string(data_dir, previous_path)?;
+    let current_path = path_to_ledger_string(data_dir, current_path)?;
     if previous_path == current_path {
         return Ok(());
     }
 
-    let previous_path = PathBuf::from(previous_path);
+    let previous_path = ledger_path_to_fs_path(data_dir, &previous_path);
     match fs::metadata(&previous_path).await {
         Ok(metadata) if metadata.is_file() => {
             fs::remove_file(&previous_path).await.with_context(|| {
@@ -1574,15 +1616,42 @@ fn path_to_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn path_to_ledger_string(path: &Path) -> Result<String> {
-    let absolute = if path.is_absolute() {
+fn path_to_ledger_string(data_dir: &Path, path: &Path) -> Result<String> {
+    let data_dir = absolutize_path(data_dir)?;
+    let path = absolutize_path(path)?;
+    if let Ok(relative) = path.strip_prefix(&data_dir) {
+        Ok(path_to_string(relative))
+    } else {
+        Ok(path_to_string(&path))
+    }
+}
+
+fn normalize_ledger_path_string(data_dir: &Path, path: &str) -> Result<String> {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        path_to_ledger_string(data_dir, path)
+    } else {
+        Ok(path_to_string(path))
+    }
+}
+
+fn ledger_path_to_fs_path(data_dir: &Path, path: &str) -> PathBuf {
+    let path = Path::new(path);
+    if path.is_absolute() {
         path.to_path_buf()
     } else {
-        std::env::current_dir()
+        data_dir.join(path)
+    }
+}
+
+fn absolutize_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()
             .context("read current directory for ledger path")?
-            .join(path)
-    };
-    Ok(path_to_string(&absolute))
+            .join(path))
+    }
 }
 
 fn canonical_video_url(video_id: &str) -> String {
@@ -1858,16 +1927,17 @@ mod tests {
     }
 
     #[test]
-    fn ledger_stores_absolute_artifact_paths() -> Result<()> {
-        let ledger = Ledger::open_in_memory()?;
+    fn ledger_stores_artifact_paths_relative_to_data_dir() -> Result<()> {
+        let dir = tempdir()?;
+        let ledger = Ledger::open(dir.path())?;
         let video_id = "abc123";
         ledger.ensure_video(video_id, &canonical_video_url(video_id))?;
 
-        ledger.mark_downloaded(video_id, Path::new("data/media/abc123/audio.m4a"))?;
+        ledger.mark_downloaded(video_id, &dir.path().join("media/abc123/audio.m4a"))?;
         let row = ledger.row(video_id)?.expect("row exists");
 
         let audio_path = row.audio_path.expect("audio path is set");
-        assert!(Path::new(&audio_path).is_absolute());
+        assert_eq!(audio_path, "media/abc123/audio.m4a");
         Ok(())
     }
 
@@ -1907,11 +1977,11 @@ mod tests {
         ledger.ensure_video(video_id, &canonical_video_url(video_id))?;
         ledger.mark_transcribed(video_id, "large", &transcript_json)?;
         let row = ledger.row(video_id)?.expect("row exists");
-        assert!(should_skip_transcription(&row, "large", false));
+        assert!(should_skip_transcription(dir.path(), &row, "large", false));
 
         ledger.mark_transcription_started(video_id)?;
         let row = ledger.row(video_id)?.expect("row exists");
-        assert!(!should_skip_transcription(&row, "large", false));
+        assert!(!should_skip_transcription(dir.path(), &row, "large", false));
         Ok(())
     }
 
@@ -1979,7 +2049,7 @@ mod tests {
         atomic_write(&old_wiki, b"old").await?;
         atomic_write(&new_wiki, b"new").await?;
 
-        remove_stale_wiki_article(Some(&path_to_string(&old_wiki)), &new_wiki).await?;
+        remove_stale_wiki_article(dir.path(), Some(&path_to_string(&old_wiki)), &new_wiki).await?;
 
         assert!(!fs::try_exists(&old_wiki).await?);
         assert!(fs::try_exists(&new_wiki).await?);
@@ -2040,39 +2110,39 @@ mod tests {
         ledger.ensure_video(video_id, &canonical_video_url(video_id))?;
 
         let mut row = row_for_skip_tests();
-        assert!(!should_skip_download(&row, false));
+        assert!(!should_skip_download(dir.path(), &row, false));
 
         let missing_audio = dir.path().join("missing.m4a");
         ledger.mark_downloaded(video_id, &missing_audio)?;
         row = ledger.row(video_id)?.expect("row exists");
-        assert!(!should_skip_download(&row, false));
+        assert!(!should_skip_download(dir.path(), &row, false));
 
         let audio = dir.path().join("audio.m4a");
         std::fs::write(&audio, b"audio")?;
         ledger.mark_downloaded(video_id, &audio)?;
         row = ledger.row(video_id)?.expect("row exists");
-        assert!(should_skip_download(&row, false));
-        assert!(!should_skip_download(&row, true));
+        assert!(should_skip_download(dir.path(), &row, false));
+        assert!(!should_skip_download(dir.path(), &row, true));
 
         let transcript_json = dir.path().join("transcript.json");
         std::fs::write(&transcript_json, b"{}")?;
         ledger.mark_transcribed(video_id, "large", &transcript_json)?;
         row = ledger.row(video_id)?.expect("row exists");
-        assert!(!should_skip_transcription(&row, "large", false));
+        assert!(!should_skip_transcription(dir.path(), &row, "large", false));
 
         let transcript_txt = dir.path().join("transcript.txt");
         std::fs::write(&transcript_txt, b"text")?;
         row = ledger.row(video_id)?.expect("row exists");
-        assert!(should_skip_transcription(&row, "large", false));
-        assert!(!should_skip_transcription(&row, "base", false));
-        assert!(!should_skip_transcription(&row, "large", true));
+        assert!(should_skip_transcription(dir.path(), &row, "large", false));
+        assert!(!should_skip_transcription(dir.path(), &row, "base", false));
+        assert!(!should_skip_transcription(dir.path(), &row, "large", true));
 
         let wiki = dir.path().join("wiki.md");
         std::fs::write(&wiki, b"wiki")?;
         ledger.mark_wiki_emitted(video_id, &wiki)?;
         row = ledger.row(video_id)?.expect("row exists");
-        assert!(should_skip_wiki(&row, false));
-        assert!(!should_skip_wiki(&row, true));
+        assert!(should_skip_wiki(dir.path(), &row, false));
+        assert!(!should_skip_wiki(dir.path(), &row, true));
 
         Ok(())
     }
