@@ -309,16 +309,6 @@ impl Ledger {
         Ok(())
     }
 
-    fn clear_error(&self, video_id: &str) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE videos SET error = NULL WHERE video_id = ?1",
-                params![video_id],
-            )
-            .with_context(|| format!("clear error for {video_id}"))?;
-        Ok(())
-    }
-
     fn mark_downloaded(&self, video_id: &str, audio_path: &Path) -> Result<()> {
         let audio_path = self.path_to_ledger_string(audio_path)?;
         self.conn
@@ -498,7 +488,6 @@ async fn ingest(args: IngestArgs) -> Result<()> {
 
         match process_video(&args, &ledger, &video_id).await {
             Ok(()) => {
-                ledger.clear_error(&video_id)?;
                 succeeded += 1;
                 info!(%video_id, "video processed");
             }
@@ -1047,10 +1036,10 @@ fn render_wiki_markdown(metadata: &VideoMetadata, transcript: &str) -> Result<St
 
     let mut output = String::new();
     output.push_str("---\n");
-    output.push_str(&format!("title: {}\n", yaml_string(title)?));
-    output.push_str(&format!("channel: {}\n", yaml_string(channel)?));
-    output.push_str(&format!("uploader: {}\n", yaml_string(uploader)?));
-    let upload_date = upload_date.map_or_else(|| Ok("null".to_owned()), yaml_string)?;
+    output.push_str(&format!("title: {}\n", yaml_string(title)));
+    output.push_str(&format!("channel: {}\n", yaml_string(channel)));
+    output.push_str(&format!("uploader: {}\n", yaml_string(uploader)));
+    let upload_date = upload_date.map_or_else(|| "null".to_owned(), yaml_string);
     output.push_str(&format!("upload_date: {}\n", upload_date));
     output.push_str(&format!(
         "duration: {}\n",
@@ -1058,15 +1047,15 @@ fn render_wiki_markdown(metadata: &VideoMetadata, transcript: &str) -> Result<St
             .duration
             .map_or_else(|| "null".to_owned(), |duration| duration.to_string())
     ));
-    output.push_str(&format!("url: {}\n", yaml_string(&metadata.url)?));
-    output.push_str(&format!("video_id: {}\n", yaml_string(&metadata.video_id)?));
+    output.push_str(&format!("url: {}\n", yaml_string(&metadata.url)));
+    output.push_str(&format!("video_id: {}\n", yaml_string(&metadata.video_id)));
     output.push_str("tags:");
     if metadata.tags.is_empty() {
         output.push_str(" []\n");
     } else {
         output.push('\n');
         for tag in &metadata.tags {
-            output.push_str(&format!("  - {}\n", yaml_string(tag)?));
+            output.push_str(&format!("  - {}\n", yaml_string(tag)));
         }
     }
     output.push_str("---\n\n");
@@ -1075,8 +1064,8 @@ fn render_wiki_markdown(metadata: &VideoMetadata, transcript: &str) -> Result<St
     Ok(output)
 }
 
-fn yaml_string(value: &str) -> Result<String> {
-    serde_json::to_string(value).context("encode YAML string")
+fn yaml_string(value: &str) -> String {
+    serde_json::to_string(value).expect("serializing a string cannot fail")
 }
 
 fn slugify(value: &str) -> String {
@@ -1267,17 +1256,17 @@ async fn run_checked_stream_stderr(program: &str, args: &[String]) -> Result<Out
         let mut captured = Vec::new();
         let mut truncated = false;
         let mut chunk = [0u8; 8192];
-        let mut live_stderr = std::io::stderr();
+        let mut live_stderr = tokio::io::stderr();
 
         loop {
             let read = stderr.read(&mut chunk).await?;
             if read == 0 {
                 break;
             }
-            std::io::Write::write_all(&mut live_stderr, &chunk[..read])?;
+            live_stderr.write_all(&chunk[..read]).await?;
             truncated |= push_captured_stderr(&mut captured, &chunk[..read]);
         }
-        std::io::Write::flush(&mut live_stderr)?;
+        live_stderr.flush().await?;
 
         if truncated {
             let mut prefixed =
@@ -2171,24 +2160,6 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].video_id, "good");
         assert_eq!(rows[0].tags, vec!["rust".to_owned()]);
-        Ok(())
-    }
-
-    #[test]
-    fn clear_error_removes_stale_ledger_error() -> Result<()> {
-        let ledger = Ledger::open_in_memory()?;
-        let video_id = "abc123";
-        ledger.ensure_video(video_id, &canonical_video_url(video_id))?;
-        ledger.mark_error(video_id, "old failure")?;
-
-        assert_eq!(
-            ledger.row(video_id)?.expect("row exists").error.as_deref(),
-            Some("old failure")
-        );
-
-        ledger.clear_error(video_id)?;
-
-        assert!(ledger.row(video_id)?.expect("row exists").error.is_none());
         Ok(())
     }
 
