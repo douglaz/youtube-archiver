@@ -70,8 +70,10 @@ struct IngestArgs {
 
     #[arg(
         long = "whisper-arg",
+        allow_hyphen_values = true,
+        num_args = 1,
         value_name = "ARG",
-        help = "Extra argument passed to the Whisper command; repeat for multiple args"
+        help = "Extra argument passed verbatim to the Whisper command; repeat for multiple args. Values starting with '-' are passed through."
     )]
     whisper_args: Vec<String>,
 
@@ -1990,6 +1992,25 @@ mod tests {
         ]);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parses_hyphenated_whisper_args() {
+        let cli = Cli::try_parse_from([
+            "youtube-archiver",
+            "ingest",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "--whisper-arg",
+            "--language",
+            "--whisper-arg",
+            "en",
+        ])
+        .expect("hyphenated whisper arg should parse");
+
+        let Commands::Ingest(args) = cli.command else {
+            panic!("expected ingest command");
+        };
+        assert_eq!(args.whisper_args, ["--language", "en"]);
     }
 
     #[test]
