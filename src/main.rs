@@ -1408,7 +1408,7 @@ fn validate_whisper_args(args: &[String]) -> Result<()> {
             .map_or(arg.as_str(), |(option, _)| option);
         if matches!(
             option,
-            "--output_dir" | "--output-dir" | "--output_format" | "--output-format"
+            "-o" | "--output_dir" | "--output-dir" | "--output_format" | "--output-format"
         ) {
             bail!(
                 "--whisper-arg {option} is managed by youtube-archiver; use --data-dir for archive location"
@@ -2164,6 +2164,14 @@ mod tests {
         let err = validate_whisper_args(&args).expect_err("output dir should be rejected");
 
         assert!(format!("{err:#}").contains("--output_dir"));
+    }
+
+    #[test]
+    fn rejects_whisper_short_output_dir_arg() {
+        let args = vec!["-o".to_owned(), "/tmp/elsewhere".to_owned()];
+        let err = validate_whisper_args(&args).expect_err("short output dir should be rejected");
+
+        assert!(format!("{err:#}").contains("-o"));
     }
 
     #[test]
