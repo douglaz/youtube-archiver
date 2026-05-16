@@ -1957,12 +1957,14 @@ async fn replace_transcript_pair(
                 .await
                 .with_context(|| format!("back up {}", final_txt.display()))?;
             backed_up_txt = true;
+            sync_parent_dir(final_txt).await?;
         }
         if fs::try_exists(final_json).await.unwrap_or(false) {
             fs::rename(final_json, &backup_json)
                 .await
                 .with_context(|| format!("back up {}", final_json.display()))?;
             backed_up_json = true;
+            sync_parent_dir(final_json).await?;
         }
         Ok(())
     }
@@ -1985,9 +1987,11 @@ async fn replace_transcript_pair(
         fs::rename(source_json, final_json)
             .await
             .with_context(|| format!("move transcript JSON to {}", final_json.display()))?;
+        sync_parent_dir(final_json).await?;
         fs::rename(source_txt, final_txt)
             .await
             .with_context(|| format!("move transcript text to {}", final_txt.display()))?;
+        sync_parent_dir(final_txt).await?;
         Ok(())
     }
     .await;
