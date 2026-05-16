@@ -371,6 +371,7 @@ impl Ledger {
                 SET transcribed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
                     whisper_model = ?2,
                     transcript_path = ?3,
+                    -- Preserve wiki_path so re-emission can remove stale slug paths.
                     wiki_emitted_at = NULL,
                     error = NULL
                 WHERE video_id = ?1
