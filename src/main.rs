@@ -1774,7 +1774,7 @@ fn stage_temp_path_pid(file_name: &str, prefix: &str) -> Option<u32> {
 
 #[cfg(target_os = "linux")]
 async fn should_remove_stage_temp_path_for_pid(_path: &Path, pid: u32) -> Result<bool> {
-    Ok(!process_exists(pid))
+    Ok(!process_matches_current_exe(pid))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1790,10 +1790,15 @@ async fn should_remove_stage_temp_path_for_pid(path: &Path, _pid: u32) -> Result
 }
 
 #[cfg(target_os = "linux")]
-fn process_exists(pid: u32) -> bool {
-    // This is a best-effort liveness check: PID reuse can make an unrelated
-    // process look active, in which case the stale temp path is kept.
-    Path::new("/proc").join(pid.to_string()).exists()
+fn process_matches_current_exe(pid: u32) -> bool {
+    let proc_exe = Path::new("/proc").join(pid.to_string()).join("exe");
+    let Ok(process_exe) = std::fs::read_link(proc_exe) else {
+        return false;
+    };
+    let Ok(current_exe) = std::env::current_exe() else {
+        return true;
+    };
+    process_exe == current_exe
 }
 
 async fn find_whisper_outputs(tmp_dir: &Path, preferred_stem: &str) -> Result<(PathBuf, PathBuf)> {
@@ -2626,6 +2631,13 @@ mod tests {
         assert!(fs::try_exists(&unrelated_dir).await?);
         assert!(fs::try_exists(&ordinary_file).await?);
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_match_check_uses_current_exe() {
+        assert!(process_matches_current_exe(std::process::id()));
+        assert!(!process_matches_current_exe(u32::MAX));
     }
 
     #[test]
