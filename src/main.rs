@@ -1353,17 +1353,13 @@ async fn run_checked_stream_output(program: &str, args: &[String]) -> Result<Out
             if read == 0 {
                 break;
             }
-            if !live_stdout_failed
-                && let Err(err) = live_stdout.write_all(&chunk[..read]).await
-            {
+            if !live_stdout_failed && let Err(err) = live_stdout.write_all(&chunk[..read]).await {
                 live_stdout_failed = true;
                 warn!(stream = "stdout", error = %err, "failed to write child output to live stream");
             }
             truncated |= push_captured_output(&mut captured, &chunk[..read]);
         }
-        if !live_stdout_failed
-            && let Err(err) = live_stdout.flush().await
-        {
+        if !live_stdout_failed && let Err(err) = live_stdout.flush().await {
             warn!(stream = "stdout", error = %err, "failed to flush child output live stream");
         }
 
@@ -1385,17 +1381,13 @@ async fn run_checked_stream_output(program: &str, args: &[String]) -> Result<Out
             if read == 0 {
                 break;
             }
-            if !live_stderr_failed
-                && let Err(err) = live_stderr.write_all(&chunk[..read]).await
-            {
+            if !live_stderr_failed && let Err(err) = live_stderr.write_all(&chunk[..read]).await {
                 live_stderr_failed = true;
                 warn!(stream = "stderr", error = %err, "failed to write child output to live stream");
             }
             truncated |= push_captured_output(&mut captured, &chunk[..read]);
         }
-        if !live_stderr_failed
-            && let Err(err) = live_stderr.flush().await
-        {
+        if !live_stderr_failed && let Err(err) = live_stderr.flush().await {
             warn!(stream = "stderr", error = %err, "failed to flush child output live stream");
         }
 
