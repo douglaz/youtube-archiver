@@ -1303,6 +1303,11 @@ fn validate_whisper_args(args: &[String]) -> Result<()> {
                 "--whisper-arg {option} is managed by youtube-archiver; use --data-dir for archive location"
             );
         }
+        if option == "--model" {
+            bail!(
+                "--whisper-arg {option} is managed by youtube-archiver; use --whisper-model instead"
+            );
+        }
     }
     Ok(())
 }
@@ -1992,6 +1997,14 @@ mod tests {
         let err = validate_whisper_args(&args).expect_err("output dir should be rejected");
 
         assert!(format!("{err:#}").contains("--output_dir"));
+    }
+
+    #[test]
+    fn rejects_whisper_model_args() {
+        let args = vec!["--model".to_owned(), "base".to_owned()];
+        let err = validate_whisper_args(&args).expect_err("model should be rejected");
+
+        assert!(format!("{err:#}").contains("--whisper-model"));
     }
 
     #[test]
