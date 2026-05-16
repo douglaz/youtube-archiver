@@ -1346,16 +1346,26 @@ async fn run_checked_stream_output(program: &str, args: &[String]) -> Result<Out
         let mut truncated = false;
         let mut chunk = [0u8; 8192];
         let mut live_stdout = tokio::io::stdout();
+        let mut live_stdout_failed = false;
 
         loop {
             let read = stdout.read(&mut chunk).await?;
             if read == 0 {
                 break;
             }
-            live_stdout.write_all(&chunk[..read]).await?;
+            if !live_stdout_failed
+                && let Err(err) = live_stdout.write_all(&chunk[..read]).await
+            {
+                live_stdout_failed = true;
+                warn!(stream = "stdout", error = %err, "failed to write child output to live stream");
+            }
             truncated |= push_captured_output(&mut captured, &chunk[..read]);
         }
-        live_stdout.flush().await?;
+        if !live_stdout_failed
+            && let Err(err) = live_stdout.flush().await
+        {
+            warn!(stream = "stdout", error = %err, "failed to flush child output live stream");
+        }
 
         if truncated {
             add_truncation_notice(&mut captured, "stdout");
@@ -1368,16 +1378,26 @@ async fn run_checked_stream_output(program: &str, args: &[String]) -> Result<Out
         let mut truncated = false;
         let mut chunk = [0u8; 8192];
         let mut live_stderr = tokio::io::stderr();
+        let mut live_stderr_failed = false;
 
         loop {
             let read = stderr.read(&mut chunk).await?;
             if read == 0 {
                 break;
             }
-            live_stderr.write_all(&chunk[..read]).await?;
+            if !live_stderr_failed
+                && let Err(err) = live_stderr.write_all(&chunk[..read]).await
+            {
+                live_stderr_failed = true;
+                warn!(stream = "stderr", error = %err, "failed to write child output to live stream");
+            }
             truncated |= push_captured_output(&mut captured, &chunk[..read]);
         }
-        live_stderr.flush().await?;
+        if !live_stderr_failed
+            && let Err(err) = live_stderr.flush().await
+        {
+            warn!(stream = "stderr", error = %err, "failed to flush child output live stream");
+        }
 
         if truncated {
             add_truncation_notice(&mut captured, "stderr");
@@ -1410,7 +1430,7 @@ async fn run_checked_stream_output(program: &str, args: &[String]) -> Result<Out
 }
 
 fn push_captured_output(captured: &mut Vec<u8>, chunk: &[u8]) -> bool {
-    if chunk.len() >= STREAMED_OUTPUT_CAPTURE_LIMIT {
+    if chunk.len() > STREAMED_OUTPUT_CAPTURE_LIMIT {
         captured.clear();
         captured.extend_from_slice(&chunk[chunk.len() - STREAMED_OUTPUT_CAPTURE_LIMIT..]);
         return true;
@@ -1445,12 +1465,25 @@ fn ensure_success(program: &str, args: &[String], output: Output) -> Result<Outp
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stderr = stderr.trim();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = stdout.trim();
+        let mut details = Vec::new();
+        if !stderr.is_empty() {
+            details.push(format!("stderr: {stderr}"));
+        }
+        if !stdout.is_empty() {
+            details.push(format!("stdout: {stdout}"));
+        }
+        let details = if details.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", details.join("; "))
+        };
         bail!(
-            "{} exited with {}{}{}",
+            "{} exited with {}{}",
             format_command(program, args),
             output.status,
-            if stderr.is_empty() { "" } else { ": " },
-            stderr
+            details,
         );
     }
 }
@@ -2776,6 +2809,15 @@ mod tests {
         assert!(push_captured_output(&mut captured, b"bcde"));
         assert_eq!(captured.len(), STREAMED_OUTPUT_CAPTURE_LIMIT);
         assert_eq!(&captured[STREAMED_OUTPUT_CAPTURE_LIMIT - 4..], b"bcde");
+    }
+
+    #[test]
+    fn captured_stream_output_exact_limit_is_not_truncated() {
+        let mut captured = Vec::new();
+        let chunk = vec![b'a'; STREAMED_OUTPUT_CAPTURE_LIMIT];
+
+        assert!(!push_captured_output(&mut captured, &chunk));
+        assert_eq!(captured.len(), STREAMED_OUTPUT_CAPTURE_LIMIT);
     }
 
     #[test]
