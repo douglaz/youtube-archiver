@@ -1486,7 +1486,9 @@ async fn sync_parent_dir(path: &Path) -> Result<()> {
 }
 
 async fn find_audio_file(tmp_dir: &Path, preferred_ext: &str) -> Result<PathBuf> {
-    let mut fallback = None;
+    let preferred_ext = preferred_ext.trim_start_matches('.');
+    let accept_any_ext = preferred_ext.eq_ignore_ascii_case("best");
+    let mut wrong_format = None;
     let mut entries = fs::read_dir(tmp_dir)
         .await
         .with_context(|| format!("read {}", tmp_dir.display()))?;
@@ -1513,18 +1515,28 @@ async fn find_audio_file(tmp_dir: &Path, preferred_ext: &str) -> Result<PathBuf>
             continue;
         }
 
-        if path.extension().and_then(|ext| ext.to_str()) == Some(preferred_ext) {
+        let extension = path.extension().and_then(|ext| ext.to_str());
+        if accept_any_ext || extension.is_some_and(|ext| ext.eq_ignore_ascii_case(preferred_ext)) {
             return Ok(path);
         }
-        fallback.get_or_insert(path);
+        wrong_format.get_or_insert(path);
     }
 
-    fallback.ok_or_else(|| {
-        anyhow!(
-            "yt-dlp did not produce an audio file in {}",
+    if let Some(path) = wrong_format {
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("audio file");
+        bail!(
+            "yt-dlp produced {file_name} but not requested audio.{preferred_ext} in {}",
             tmp_dir.display()
-        )
-    })
+        );
+    }
+
+    bail!(
+        "yt-dlp did not produce an audio.{preferred_ext} file in {}",
+        tmp_dir.display()
+    )
 }
 
 async fn remove_stale_audio_files(media_dir: &Path, keep_path: &Path) -> Result<()> {
@@ -2368,6 +2380,32 @@ mod tests {
             json
         );
         assert_eq!(find_whisper_output(dir.path(), "txt", "audio").await?, txt);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn find_audio_file_prefers_requested_extension() -> Result<()> {
+        let dir = tempdir()?;
+        let webm = dir.path().join("audio.webm");
+        let m4a = dir.path().join("audio.m4a");
+        fs::write(&webm, b"webm").await?;
+        fs::write(&m4a, b"m4a").await?;
+
+        assert_eq!(find_audio_file(dir.path(), "m4a").await?, m4a);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn find_audio_file_rejects_unrequested_extension() -> Result<()> {
+        let dir = tempdir()?;
+        let webm = dir.path().join("audio.webm");
+        fs::write(&webm, b"webm").await?;
+
+        let err = find_audio_file(dir.path(), "m4a")
+            .await
+            .expect_err("wrong audio extension should be rejected");
+
+        assert!(format!("{err:#}").contains("requested audio.m4a"));
         Ok(())
     }
 
