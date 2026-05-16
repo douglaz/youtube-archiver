@@ -659,13 +659,7 @@ async fn load_or_fetch_metadata(
     let media_dir = data_dir.join("media").join(video_id);
     let info_path = media_dir.join("info.json");
 
-    if !force && fs::try_exists(&info_path).await.unwrap_or(false) {
-        let bytes = fs::read(&info_path)
-            .await
-            .with_context(|| format!("read existing {}", info_path.display()))?;
-        let value: Value = serde_json::from_slice(&bytes)
-            .with_context(|| format!("parse existing {}", info_path.display()))?;
-        let metadata = metadata_from_value(video_id, &value);
+    if !force && let Some(metadata) = load_cached_metadata(video_id, &info_path).await? {
         ledger.upsert_metadata(&metadata)?;
         return Ok(metadata);
     }
@@ -688,6 +682,29 @@ async fn load_or_fetch_metadata(
     let metadata = metadata_from_value(video_id, &value);
     ledger.upsert_metadata(&metadata)?;
     Ok(metadata)
+}
+
+async fn load_cached_metadata(video_id: &str, info_path: &Path) -> Result<Option<VideoMetadata>> {
+    let bytes = match fs::read(info_path).await {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("read existing {}", info_path.display()));
+        }
+    };
+
+    if bytes.is_empty() {
+        warn!(path = %info_path.display(), "cached metadata is empty; refetching");
+        return Ok(None);
+    }
+
+    match serde_json::from_slice::<Value>(&bytes) {
+        Ok(value) => Ok(Some(metadata_from_value(video_id, &value))),
+        Err(err) => {
+            warn!(path = %info_path.display(), error = %err, "cached metadata is invalid JSON; refetching");
+            Ok(None)
+        }
+    }
 }
 
 async fn download_audio(
@@ -2216,6 +2233,39 @@ mod tests {
         assert_eq!(row.upload_date.as_deref(), Some("20260102"));
         assert_eq!(row.duration, Some(123));
         assert_eq!(row.tags, vec!["rust".to_owned(), "youtube".to_owned()]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cached_metadata_invalid_json_is_ignored() -> Result<()> {
+        let dir = tempdir()?;
+        let info_path = dir.path().join("info.json");
+        fs::write(&info_path, b"not json").await?;
+
+        let metadata = load_cached_metadata("dQw4w9WgXcQ", &info_path).await?;
+
+        assert!(metadata.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cached_metadata_loads_valid_json() -> Result<()> {
+        let dir = tempdir()?;
+        let info_path = dir.path().join("info.json");
+        fs::write(
+            &info_path,
+            br#"{"title":"A Video","channel":"Rust Channel","tags":["rust"]}"#,
+        )
+        .await?;
+
+        let metadata = load_cached_metadata("dQw4w9WgXcQ", &info_path)
+            .await?
+            .expect("valid metadata should load");
+
+        assert_eq!(metadata.video_id, "dQw4w9WgXcQ");
+        assert_eq!(metadata.title.as_deref(), Some("A Video"));
+        assert_eq!(metadata.channel_title.as_deref(), Some("Rust Channel"));
+        assert_eq!(metadata.tags, vec!["rust".to_owned()]);
         Ok(())
     }
 
