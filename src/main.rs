@@ -650,7 +650,12 @@ async fn load_or_fetch_metadata(
         .with_context(|| format!("create {}", media_dir.display()))?;
 
     let url = canonical_video_url(video_id);
-    let args = vec!["-j".to_owned(), "--no-playlist".to_owned(), url];
+    let args = vec![
+        "-j".to_owned(),
+        "--no-playlist".to_owned(),
+        "--".to_owned(),
+        url,
+    ];
     let output = run_checked("yt-dlp", &args).await?;
     let value: Value = serde_json::from_slice(&output.stdout)
         .with_context(|| format!("parse yt-dlp metadata for {video_id}"))?;
