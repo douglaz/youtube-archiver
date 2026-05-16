@@ -1404,17 +1404,31 @@ async fn replace_transcript_pair(
     let mut backed_up_json = false;
     let mut backed_up_txt = false;
 
-    if fs::try_exists(final_txt).await.unwrap_or(false) {
-        fs::rename(final_txt, &backup_txt)
-            .await
-            .with_context(|| format!("back up {}", final_txt.display()))?;
-        backed_up_txt = true;
+    let backup_result: Result<()> = async {
+        if fs::try_exists(final_txt).await.unwrap_or(false) {
+            fs::rename(final_txt, &backup_txt)
+                .await
+                .with_context(|| format!("back up {}", final_txt.display()))?;
+            backed_up_txt = true;
+        }
+        if fs::try_exists(final_json).await.unwrap_or(false) {
+            fs::rename(final_json, &backup_json)
+                .await
+                .with_context(|| format!("back up {}", final_json.display()))?;
+            backed_up_json = true;
+        }
+        Ok(())
     }
-    if fs::try_exists(final_json).await.unwrap_or(false) {
-        fs::rename(final_json, &backup_json)
-            .await
-            .with_context(|| format!("back up {}", final_json.display()))?;
-        backed_up_json = true;
+    .await;
+
+    if let Err(err) = backup_result {
+        if backed_up_json {
+            let _ = fs::rename(&backup_json, final_json).await;
+        }
+        if backed_up_txt {
+            let _ = fs::rename(&backup_txt, final_txt).await;
+        }
+        return Err(err);
     }
 
     let result: Result<()> = async {
