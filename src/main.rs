@@ -716,6 +716,7 @@ async fn transcribe_audio(
         "all".to_owned(),
     ]);
 
+    ledger.mark_transcription_started(video_id)?;
     let result: Result<PathBuf> = async {
         run_checked(&program, &args).await?;
         let output_stem = audio_path
@@ -726,7 +727,6 @@ async fn transcribe_audio(
         let whisper_txt = find_whisper_output(&tmp_dir, "txt", output_stem).await?;
         let final_json = transcript_dir.join("transcript.json");
         let final_txt = transcript_dir.join("transcript.txt");
-        ledger.mark_transcription_started(video_id)?;
         replace_transcript_pair(&whisper_json, &whisper_txt, &final_json, &final_txt).await?;
         Ok(final_json)
     }
