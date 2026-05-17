@@ -1205,13 +1205,29 @@ async fn should_skip_download_async(
 }
 
 fn audio_path_matches_format(path: &str, audio_format: &str) -> bool {
+    let Some(expected_extension) = expected_audio_extension(audio_format) else {
+        return !audio_format.trim_start_matches('.').is_empty();
+    };
+
+    Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case(&expected_extension))
+}
+
+fn expected_audio_extension(audio_format: &str) -> Option<String> {
     let audio_format = audio_format.trim_start_matches('.');
-    !audio_format.is_empty()
-        && (audio_format.eq_ignore_ascii_case("best")
-            || Path::new(path)
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| extension.eq_ignore_ascii_case(audio_format)))
+    if audio_format.is_empty() || audio_format.eq_ignore_ascii_case("best") {
+        return None;
+    }
+
+    let audio_format = audio_format.to_ascii_lowercase();
+    let extension = match audio_format.as_str() {
+        "aac" | "alac" | "m4a" => "m4a",
+        "vorbis" => "ogg",
+        other => other,
+    };
+    Some(extension.to_owned())
 }
 
 #[cfg(test)]
@@ -1594,9 +1610,8 @@ async fn sync_parent_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn find_audio_file(tmp_dir: &Path, preferred_ext: &str) -> Result<PathBuf> {
-    let preferred_ext = preferred_ext.trim_start_matches('.');
-    let accept_any_ext = preferred_ext.eq_ignore_ascii_case("best");
+async fn find_audio_file(tmp_dir: &Path, audio_format: &str) -> Result<PathBuf> {
+    let expected_extension = expected_audio_extension(audio_format);
     let mut wrong_format = None;
     let mut entries = fs::read_dir(tmp_dir)
         .await
@@ -1625,27 +1640,34 @@ async fn find_audio_file(tmp_dir: &Path, preferred_ext: &str) -> Result<PathBuf>
         }
 
         let extension = path.extension().and_then(|ext| ext.to_str());
-        if accept_any_ext || extension.is_some_and(|ext| ext.eq_ignore_ascii_case(preferred_ext)) {
+        if expected_extension
+            .as_deref()
+            .is_none_or(|expected| extension.is_some_and(|ext| ext.eq_ignore_ascii_case(expected)))
+        {
             return Ok(path);
         }
         wrong_format.get_or_insert(path);
     }
 
-    if let Some(path) = wrong_format {
+    if let (Some(path), Some(expected_extension)) = (wrong_format, expected_extension.as_deref()) {
         let file_name = path
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("audio file");
         bail!(
-            "yt-dlp produced {file_name} but not requested audio.{preferred_ext} in {}",
+            "yt-dlp produced {file_name} but not requested audio.{expected_extension} in {}",
             tmp_dir.display()
         );
     }
 
-    bail!(
-        "yt-dlp did not produce an audio.{preferred_ext} file in {}",
-        tmp_dir.display()
-    )
+    if let Some(expected_extension) = expected_extension {
+        bail!(
+            "yt-dlp did not produce an audio.{expected_extension} file in {}",
+            tmp_dir.display()
+        )
+    } else {
+        bail!("yt-dlp did not produce an audio file in {}", tmp_dir.display())
+    }
 }
 
 async fn remove_stale_audio_files(media_dir: &Path, keep_path: &Path) -> Result<()> {
@@ -2770,6 +2792,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn find_audio_file_accepts_yt_dlp_format_alias_extensions() -> Result<()> {
+        let dir = tempdir()?;
+        let m4a = dir.path().join("audio.m4a");
+        fs::write(&m4a, b"m4a").await?;
+
+        assert_eq!(find_audio_file(dir.path(), "aac").await?, m4a);
+
+        let dir = tempdir()?;
+        let m4a = dir.path().join("audio.m4a");
+        fs::write(&m4a, b"m4a").await?;
+
+        assert_eq!(find_audio_file(dir.path(), "alac").await?, m4a);
+
+        let dir = tempdir()?;
+        let ogg = dir.path().join("audio.ogg");
+        fs::write(&ogg, b"ogg").await?;
+
+        assert_eq!(find_audio_file(dir.path(), "vorbis").await?, ogg);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn find_audio_file_rejects_unrequested_extension() -> Result<()> {
         let dir = tempdir()?;
         let webm = dir.path().join("audio.webm");
@@ -3029,6 +3073,8 @@ mod tests {
         ledger.mark_downloaded(video_id, &audio)?;
         row = ledger.row(video_id)?.expect("row exists");
         assert!(should_skip_download(dir.path(), &row, "m4a", false));
+        assert!(should_skip_download(dir.path(), &row, "aac", false));
+        assert!(should_skip_download(dir.path(), &row, "alac", false));
         assert!(should_skip_download(dir.path(), &row, "M4A", false));
         assert!(!should_skip_download(dir.path(), &row, "opus", false));
         assert!(!should_skip_download(dir.path(), &row, "m4a", true));
