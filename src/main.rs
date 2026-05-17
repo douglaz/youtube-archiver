@@ -947,8 +947,8 @@ async fn transcribe_audio(
         let (whisper_json, whisper_txt) = find_whisper_outputs(&tmp_dir, output_stem).await?;
         let final_json = transcript_dir.join("transcript.json");
         let final_txt = transcript_dir.join("transcript.txt");
-        ledger.invalidate_transcription_outputs(video_id)?;
         replace_transcript_pair(&whisper_json, &whisper_txt, &final_json, &final_txt).await?;
+        ledger.invalidate_transcription_outputs(video_id)?;
         Ok(final_json)
     }
     .await;
@@ -2905,6 +2905,87 @@ mod tests {
         .expect_err("forced transcription should fail");
 
         assert!(format!("{err:#}").contains("exited with"));
+        let after = ledger.row(video_id)?.expect("row exists");
+        assert_eq!(after.transcribed_at, before.transcribed_at);
+        assert_eq!(after.wiki_emitted_at, before.wiki_emitted_at);
+        assert_eq!(after.transcript_path, before.transcript_path);
+        assert_eq!(after.wiki_path, before.wiki_path);
+        assert_eq!(std::fs::read(&transcript_json)?, br#"{"old":true}"#);
+        assert_eq!(std::fs::read(&transcript_txt)?, b"old transcript");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replacement_failure_preserves_existing_archive_state() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir()?;
+        let ledger = Ledger::open(dir.path())?;
+        let video_id = "dQw4w9WgXcQ";
+        let audio = dir.path().join("media/dQw4w9WgXcQ/audio.m4a");
+        let transcript_dir = dir.path().join("transcripts/dQw4w9WgXcQ");
+        let transcript_json = transcript_dir.join("transcript.json");
+        let transcript_txt = transcript_dir.join("transcript.txt");
+        let wiki = dir.path().join("wiki/channel/dQw4w9WgXcQ.md");
+        let script = dir.path().join("fake-whisper.sh");
+
+        write_test_file(&audio, b"audio")?;
+        write_test_file(&transcript_json, br#"{"old":true}"#)?;
+        write_test_file(&transcript_txt, b"old transcript")?;
+        write_test_file(&wiki, b"old wiki")?;
+        write_test_file(
+            &script,
+            br#"set -eu
+out=
+prev=
+for arg in "$@"; do
+    if [ "$prev" = "--output_dir" ]; then
+        out="$arg"
+        break
+    fi
+    prev="$arg"
+done
+mkdir -p "$out"
+printf '{"new":true}' > "$out/audio.json"
+printf 'new transcript' > "$out/audio.txt"
+chmod 555 "$(dirname "$out")"
+"#,
+        )?;
+
+        std::fs::set_permissions(&transcript_dir, std::fs::Permissions::from_mode(0o555))?;
+        let probe = transcript_dir.join("permission-probe");
+        let permissions_are_enforced = std::fs::write(&probe, b"x").is_err();
+        std::fs::set_permissions(&transcript_dir, std::fs::Permissions::from_mode(0o755))?;
+        let _ = std::fs::remove_file(&probe);
+        if !permissions_are_enforced {
+            return Ok(());
+        }
+
+        ledger.ensure_video(video_id, &canonical_video_url(video_id))?;
+        ledger.mark_downloaded(video_id, &audio)?;
+        ledger.mark_transcribed(video_id, "large", &transcript_json)?;
+        ledger.mark_wiki_emitted(video_id, &wiki)?;
+        let before = ledger.row(video_id)?.expect("row exists");
+
+        let whisper_bin = format!("sh {}", shell_words::quote(&path_to_string(&script)));
+        let result = transcribe_audio(
+            dir.path(),
+            &ledger,
+            video_id,
+            &audio,
+            WhisperConfig {
+                bin: &whisper_bin,
+                model: "large",
+                extra_args: &[],
+            },
+            true,
+        )
+        .await;
+        let _ = std::fs::set_permissions(&transcript_dir, std::fs::Permissions::from_mode(0o755));
+
+        let err = result.expect_err("replacement should fail");
+        assert!(format!("{err:#}").contains("back up"));
         let after = ledger.row(video_id)?.expect("row exists");
         assert_eq!(after.transcribed_at, before.transcribed_at);
         assert_eq!(after.wiki_emitted_at, before.wiki_emitted_at);
