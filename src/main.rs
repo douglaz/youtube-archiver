@@ -1726,7 +1726,10 @@ async fn find_audio_file(tmp_dir: &Path, audio_format: &str) -> Result<PathBuf> 
             tmp_dir.display()
         )
     } else {
-        bail!("yt-dlp did not produce an audio file in {}", tmp_dir.display())
+        bail!(
+            "yt-dlp did not produce an audio file in {}",
+            tmp_dir.display()
+        )
     }
 }
 
@@ -2235,7 +2238,10 @@ mod tests {
             classify_youtube_url("https://youtu.be/dQw4w9WgXcQ"),
             InputMode::Video
         );
-        assert_eq!(classify_youtube_url("youtu.be/dQw4w9WgXcQ"), InputMode::Video);
+        assert_eq!(
+            classify_youtube_url("youtu.be/dQw4w9WgXcQ"),
+            InputMode::Video
+        );
         assert_eq!(
             classify_youtube_url("https://www.youtube.com/shorts/dQw4w9WgXcQ"),
             InputMode::Video
@@ -3057,9 +3063,7 @@ mod tests {
     async fn atomic_write_removes_stale_temp_files() -> Result<()> {
         let dir = tempdir()?;
         let target = dir.path().join("info.json");
-        let stale = dir
-            .path()
-            .join(format!(".info.json.{}.1.0.tmp", u32::MAX));
+        let stale = dir.path().join(format!(".info.json.{}.1.0.tmp", u32::MAX));
         fs::write(&stale, b"stale").await?;
 
         atomic_write(&target, b"fresh").await?;
