@@ -1032,17 +1032,15 @@ fn row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<VideoRow> {
 fn classify_youtube_url(url: &str) -> InputMode {
     let (path, query) = split_url_path_and_query(url);
     let path = path.to_ascii_lowercase();
+    let (host, path) = split_url_host_and_path(&path);
+    let segments = path_segments(path);
 
-    if path.contains("youtu.be/")
-        || (path_has_segment(&path, "watch") && query_param_has_value(query, "v"))
-        || path_has_segment(&path, "shorts")
-        || path_has_segment(&path, "live")
-        || path_has_segment(&path, "embed")
-        || path_has_segment(&path, "v")
-        || path_has_segment(&path, "e")
+    if (host.is_some_and(is_youtu_be_host) && !segments.is_empty())
+        || (segments.first() == Some(&"watch") && query_param_has_value(query, "v"))
+        || is_canonical_video_path(&segments)
     {
         InputMode::Video
-    } else if path_has_segment(&path, "playlist") || query_param_has_value(query, "list") {
+    } else if segments.first() == Some(&"playlist") || query_param_has_value(query, "list") {
         InputMode::Playlist
     } else {
         InputMode::Channel
@@ -1058,8 +1056,59 @@ fn split_url_path_and_query(url: &str) -> (&str, Option<&str>) {
         })
 }
 
-fn path_has_segment(path: &str, segment: &str) -> bool {
-    path.split('/').any(|part| part == segment)
+fn split_url_host_and_path(path_or_url: &str) -> (Option<&str>, &str) {
+    if let Some((_, rest)) = path_or_url.split_once("://") {
+        return split_authority_and_path(rest);
+    }
+    if let Some(rest) = path_or_url.strip_prefix("//") {
+        return split_authority_and_path(rest);
+    }
+
+    let path_or_url = path_or_url.trim_start_matches('/');
+    if let Some((authority, path)) = path_or_url.split_once('/') {
+        let host = host_name(authority);
+        if is_youtube_host(host) {
+            return (Some(host), path);
+        }
+    }
+
+    (None, path_or_url)
+}
+
+fn split_authority_and_path(authority_and_path: &str) -> (Option<&str>, &str) {
+    match authority_and_path.split_once('/') {
+        Some((authority, path)) => (Some(host_name(authority)), path),
+        None => (Some(host_name(authority_and_path)), ""),
+    }
+}
+
+fn host_name(authority: &str) -> &str {
+    authority
+        .rsplit('@')
+        .next()
+        .unwrap_or(authority)
+        .split(':')
+        .next()
+        .unwrap_or(authority)
+}
+
+fn path_segments(path: &str) -> Vec<&str> {
+    path.split('/').filter(|part| !part.is_empty()).collect()
+}
+
+fn is_canonical_video_path(segments: &[&str]) -> bool {
+    matches!(
+        segments,
+        ["shorts", _, ..] | ["live", _, ..] | ["embed", _, ..] | ["v", _, ..] | ["e", _, ..]
+    )
+}
+
+fn is_youtube_host(host: &str) -> bool {
+    host == "youtube.com" || host.ends_with(".youtube.com") || is_youtu_be_host(host)
+}
+
+fn is_youtu_be_host(host: &str) -> bool {
+    host == "youtu.be" || host.ends_with(".youtu.be")
 }
 
 fn query_param_has_value(query: Option<&str>, key: &str) -> bool {
@@ -2177,6 +2226,7 @@ mod tests {
             classify_youtube_url("https://youtu.be/dQw4w9WgXcQ"),
             InputMode::Video
         );
+        assert_eq!(classify_youtube_url("youtu.be/dQw4w9WgXcQ"), InputMode::Video);
         assert_eq!(
             classify_youtube_url("https://www.youtube.com/shorts/dQw4w9WgXcQ"),
             InputMode::Video
@@ -2207,6 +2257,18 @@ mod tests {
         );
         assert_eq!(
             classify_youtube_url("https://www.youtube.com/@SomeChannel/videos"),
+            InputMode::Channel
+        );
+        assert_eq!(
+            classify_youtube_url("https://www.youtube.com/@SomeChannel/shorts"),
+            InputMode::Channel
+        );
+        assert_eq!(
+            classify_youtube_url("https://www.youtube.com/@SomeChannel/live"),
+            InputMode::Channel
+        );
+        assert_eq!(
+            classify_youtube_url("https://www.youtube.com/@SomeChannel/streams"),
             InputMode::Channel
         );
         assert_eq!(
