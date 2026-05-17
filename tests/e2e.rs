@@ -131,6 +131,7 @@ fn run_success(args: &[String]) -> Result<(), Box<dyn Error>> {
 fn run_output(args: &[String]) -> Result<std::process::Output, Box<dyn Error>> {
     let output = Command::new(env!("CARGO_BIN_EXE_youtube-archiver"))
         .args(args)
+        .env("RUST_LOG", "warn")
         .output()?;
     assert!(
         output.status.success(),
