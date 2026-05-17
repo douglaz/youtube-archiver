@@ -388,7 +388,7 @@ impl Ledger {
         Ok(())
     }
 
-    fn mark_transcription_started(&self, video_id: &str) -> Result<()> {
+    fn invalidate_transcription_outputs(&self, video_id: &str) -> Result<()> {
         self.conn
             .execute(
                 r#"
@@ -399,7 +399,7 @@ impl Ledger {
                 "#,
                 params![video_id],
             )
-            .with_context(|| format!("mark {video_id} transcription started"))?;
+            .with_context(|| format!("invalidate transcription outputs for {video_id}"))?;
         Ok(())
     }
 
@@ -855,8 +855,8 @@ async fn transcribe_audio(
         let (whisper_json, whisper_txt) = find_whisper_outputs(&tmp_dir, output_stem).await?;
         let final_json = transcript_dir.join("transcript.json");
         let final_txt = transcript_dir.join("transcript.txt");
+        ledger.invalidate_transcription_outputs(video_id)?;
         replace_transcript_pair(&whisper_json, &whisper_txt, &final_json, &final_txt).await?;
-        ledger.mark_transcription_started(video_id)?;
         Ok(final_json)
     }
     .await;
@@ -2750,7 +2750,7 @@ mod tests {
     }
 
     #[test]
-    fn marking_transcription_started_invalidates_transcription_skip() -> Result<()> {
+    fn invalidating_transcription_outputs_disables_transcription_skip() -> Result<()> {
         let dir = tempdir()?;
         let ledger = Ledger::open_in_memory()?;
         let video_id = "abc123";
@@ -2767,7 +2767,7 @@ mod tests {
         assert!(should_skip_transcription(dir.path(), &row, "large", false));
         assert!(row.wiki_emitted_at.is_some());
 
-        ledger.mark_transcription_started(video_id)?;
+        ledger.invalidate_transcription_outputs(video_id)?;
         let row = ledger.row(video_id)?.expect("row exists");
         assert!(!should_skip_transcription(dir.path(), &row, "large", false));
         assert!(row.wiki_emitted_at.is_none());
