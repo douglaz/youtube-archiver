@@ -1322,6 +1322,7 @@ async fn run_checked(program: &str, args: &[String]) -> Result<Output> {
     let output = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
+        .kill_on_drop(true)
         .output()
         .await
         .with_context(|| format!("run {}", format_command(program, args)))?;
@@ -1334,6 +1335,7 @@ async fn run_checked_stream_output(program: &str, args: &[String]) -> Result<Out
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("run {}", format_command(program, args)))?;
     let mut stdout = child
