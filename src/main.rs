@@ -2228,20 +2228,18 @@ async fn replace_transcript_pair(
         return Err(err);
     }
 
-    let result: Result<()> = async {
+    let move_result: Result<()> = async {
         fs::rename(source_json, final_json)
             .await
             .with_context(|| format!("move transcript JSON to {}", final_json.display()))?;
-        sync_parent_dir(final_json).await?;
         fs::rename(source_txt, final_txt)
             .await
             .with_context(|| format!("move transcript text to {}", final_txt.display()))?;
-        sync_parent_dir(final_txt).await?;
         Ok(())
     }
     .await;
 
-    if let Err(err) = result {
+    if let Err(err) = move_result {
         let _ = fs::remove_file(final_json).await;
         let _ = fs::remove_file(final_txt).await;
         if backed_up_json {
@@ -2263,6 +2261,8 @@ async fn replace_transcript_pair(
         let _ = fs::remove_file(&backup_txt).await;
     }
 
+    // The new pair is visible now. A directory sync failure is durability-related;
+    // report it, but do not roll back data that was successfully renamed.
     sync_pair_parent_dirs(final_json, final_txt).await?;
 
     Ok(())
