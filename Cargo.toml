@@ -2,6 +2,9 @@
 name = "youtube-archiver"
 version = "0.1.0"
 edition = "2024"
+description = "Archive YouTube audio, transcribe with Whisper, emit llm-wiki-ingestible markdown"
+license = "MIT"
+repository = "https://github.com/douglaz/youtube-archiver"
 
 [dependencies]
 anyhow = "1"
