@@ -898,7 +898,7 @@ async fn download_audio(
     let url = canonical_video_url(video_id);
     let args = vec![
         "-f".to_owned(),
-        "bestaudio".to_owned(),
+        "bestaudio/best".to_owned(),
         "--extract-audio".to_owned(),
         "--audio-format".to_owned(),
         audio_format.to_owned(),
