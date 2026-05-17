@@ -182,6 +182,113 @@ struct VideoRow {
     error: Option<String>,
 }
 
+struct LedgerColumn {
+    name: &'static str,
+    create_sql: &'static str,
+    migration_sql: Option<&'static str>,
+}
+
+const LEDGER_COLUMNS: &[LedgerColumn] = &[
+    LedgerColumn {
+        name: "video_id",
+        create_sql: "video_id TEXT PRIMARY KEY",
+        migration_sql: None,
+    },
+    LedgerColumn {
+        name: "url",
+        create_sql: "url TEXT NOT NULL",
+        migration_sql: None,
+    },
+    LedgerColumn {
+        name: "channel_id",
+        create_sql: "channel_id TEXT",
+        migration_sql: None,
+    },
+    LedgerColumn {
+        name: "channel_title",
+        create_sql: "channel_title TEXT",
+        migration_sql: None,
+    },
+    LedgerColumn {
+        name: "uploader",
+        create_sql: "uploader TEXT",
+        migration_sql: Some("ALTER TABLE videos ADD COLUMN uploader TEXT"),
+    },
+    LedgerColumn {
+        name: "title",
+        create_sql: "title TEXT",
+        migration_sql: None,
+    },
+    LedgerColumn {
+        name: "upload_date",
+        create_sql: "upload_date TEXT",
+        migration_sql: Some("ALTER TABLE videos ADD COLUMN upload_date TEXT"),
+    },
+    LedgerColumn {
+        name: "duration",
+        create_sql: "duration INTEGER",
+        migration_sql: Some("ALTER TABLE videos ADD COLUMN duration INTEGER"),
+    },
+    LedgerColumn {
+        name: "tags",
+        create_sql: "tags TEXT",
+        migration_sql: Some("ALTER TABLE videos ADD COLUMN tags TEXT"),
+    },
+    LedgerColumn {
+        name: "downloaded_at",
+        create_sql: "downloaded_at TEXT",
+        migration_sql: None,
+    },
+    LedgerColumn {
+        name: "transcribed_at",
+        create_sql: "transcribed_at TEXT",
+        migration_sql: None,
+    },
+    LedgerColumn {
+        name: "wiki_emitted_at",
+        create_sql: "wiki_emitted_at TEXT",
+        migration_sql: None,
+    },
+    LedgerColumn {
+        name: "whisper_model",
+        create_sql: "whisper_model TEXT",
+        migration_sql: None,
+    },
+    LedgerColumn {
+        name: "audio_path",
+        create_sql: "audio_path TEXT",
+        migration_sql: None,
+    },
+    LedgerColumn {
+        name: "transcript_path",
+        create_sql: "transcript_path TEXT",
+        migration_sql: None,
+    },
+    LedgerColumn {
+        name: "wiki_path",
+        create_sql: "wiki_path TEXT",
+        migration_sql: None,
+    },
+    LedgerColumn {
+        name: "error",
+        create_sql: "error TEXT",
+        migration_sql: None,
+    },
+];
+
+fn create_videos_table_sql() -> String {
+    let mut sql = "CREATE TABLE IF NOT EXISTS videos (\n".to_owned();
+    for (index, column) in LEDGER_COLUMNS.iter().enumerate() {
+        if index > 0 {
+            sql.push_str(",\n");
+        }
+        sql.push_str("                    ");
+        sql.push_str(column.create_sql);
+    }
+    sql.push_str("\n                );");
+    sql
+}
+
 struct Ledger {
     conn: Connection,
     data_dir: PathBuf,
@@ -230,46 +337,24 @@ impl Ledger {
     }
 
     fn init(&self) -> Result<()> {
+        let create_sql = create_videos_table_sql();
         self.conn
-            .execute_batch(
-                r#"
-                CREATE TABLE IF NOT EXISTS videos (
-                    video_id TEXT PRIMARY KEY,
-                    url TEXT NOT NULL,
-                    channel_id TEXT,
-                    channel_title TEXT,
-                    uploader TEXT,
-                    title TEXT,
-                    upload_date TEXT,
-                    duration INTEGER,
-                    tags TEXT,
-                    downloaded_at TEXT,
-                    transcribed_at TEXT,
-                    wiki_emitted_at TEXT,
-                    whisper_model TEXT,
-                    audio_path TEXT,
-                    transcript_path TEXT,
-                    wiki_path TEXT,
-                    error TEXT
-                );
-                "#,
-            )
+            .execute_batch(&create_sql)
             .context("initialize ledger schema")?;
-        self.ensure_column("uploader")?;
-        self.ensure_column("upload_date")?;
-        self.ensure_column("duration")?;
-        self.ensure_column("tags")?;
+        for column in LEDGER_COLUMNS
+            .iter()
+            .filter(|column| column.migration_sql.is_some())
+        {
+            self.ensure_column(column.name)?;
+        }
         Ok(())
     }
 
     fn ensure_column(&self, name: &str) -> Result<()> {
-        let alter_sql = match name {
-            "uploader" => "ALTER TABLE videos ADD COLUMN uploader TEXT",
-            "upload_date" => "ALTER TABLE videos ADD COLUMN upload_date TEXT",
-            "duration" => "ALTER TABLE videos ADD COLUMN duration INTEGER",
-            "tags" => "ALTER TABLE videos ADD COLUMN tags TEXT",
-            _ => bail!("unsupported ledger migration column {name:?}"),
-        };
+        let column = LEDGER_COLUMNS
+            .iter()
+            .find(|column| column.name == name && column.migration_sql.is_some())
+            .ok_or_else(|| anyhow!("unsupported ledger migration column {name:?}"))?;
 
         let mut stmt = self
             .conn
@@ -284,7 +369,12 @@ impl Ledger {
         }
 
         self.conn
-            .execute(alter_sql, [])
+            .execute(
+                column
+                    .migration_sql
+                    .expect("migration column has migration SQL"),
+                [],
+            )
             .with_context(|| format!("add ledger column {name}"))?;
         Ok(())
     }
