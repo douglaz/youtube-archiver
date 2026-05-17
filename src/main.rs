@@ -2609,7 +2609,7 @@ mod tests {
 
         let err = ledger.row("abc123").expect_err("corrupt tags should fail");
 
-        assert!(format!("{err:#}").contains("expected ident"));
+        assert!(err.to_string().contains("read ledger row for abc123"));
         Ok(())
     }
 
