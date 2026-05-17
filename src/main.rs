@@ -496,6 +496,31 @@ impl Ledger {
         Ok(())
     }
 
+    fn restore_transcription_outputs(&self, row: &VideoRow) -> Result<()> {
+        self.conn
+            .execute(
+                r#"
+                UPDATE videos
+                SET transcribed_at = ?2,
+                    wiki_emitted_at = ?3,
+                    whisper_model = ?4,
+                    transcript_path = ?5,
+                    wiki_path = ?6
+                WHERE video_id = ?1
+                "#,
+                params![
+                    row.video_id,
+                    row.transcribed_at,
+                    row.wiki_emitted_at,
+                    row.whisper_model,
+                    row.transcript_path,
+                    row.wiki_path
+                ],
+            )
+            .with_context(|| format!("restore transcription outputs for {}", row.video_id))?;
+        Ok(())
+    }
+
     fn mark_wiki_emitted(&self, video_id: &str, wiki_path: &Path) -> Result<()> {
         let wiki_path = self.path_to_ledger_string(wiki_path)?;
         self.conn
@@ -908,13 +933,15 @@ async fn transcribe_audio(
     whisper: WhisperConfig<'_>,
     force: bool,
 ) -> Result<PathBuf> {
-    if let Some(row) = ledger.row(video_id)?
+    let previous_row = ledger.row(video_id)?;
+    if let Some(row) = previous_row.as_ref()
         && should_skip_transcription_async(data_dir, &row, whisper.model, force).await
     {
         let transcript_path = row
             .transcript_path
+            .as_deref()
             .expect("checked by should_skip_transcription_async");
-        return Ok(ledger_path_to_fs_path(data_dir, &transcript_path));
+        return Ok(ledger_path_to_fs_path(data_dir, transcript_path));
     }
 
     let transcript_dir = data_dir.join("transcripts").join(video_id);
@@ -950,8 +977,17 @@ async fn transcribe_audio(
         let (whisper_json, whisper_txt) = find_whisper_outputs(&tmp_dir, output_stem).await?;
         let final_json = transcript_dir.join("transcript.json");
         let final_txt = transcript_dir.join("transcript.txt");
-        replace_transcript_pair(&whisper_json, &whisper_txt, &final_json, &final_txt).await?;
         ledger.invalidate_transcription_outputs(video_id)?;
+        if let Err(err) =
+            replace_transcript_pair(&whisper_json, &whisper_txt, &final_json, &final_txt).await
+        {
+            if let Some(row) = previous_row.as_ref()
+                && let Err(restore_err) = ledger.restore_transcription_outputs(row)
+            {
+                warn!(%video_id, error = %restore_err, "failed to restore transcription ledger state after replacement failure");
+            }
+            return Err(err);
+        }
         Ok(final_json)
     }
     .await;
