@@ -601,7 +601,7 @@ async fn main() -> Result<()> {
     match Cli::parse().command {
         Commands::Ingest(args) => ingest(args).await,
         Commands::Status(args) => status(args).await,
-        Commands::List(args) => list(args),
+        Commands::List(args) => list(args).await,
     }
 }
 
@@ -1055,8 +1055,8 @@ async fn status(args: DataDirArgs) -> Result<()> {
     Ok(())
 }
 
-fn list(args: DataDirArgs) -> Result<()> {
-    let rows = list_rows(&args.data_dir)?;
+async fn list(args: DataDirArgs) -> Result<()> {
+    let rows = list_rows(&args.data_dir).await?;
     println!(
         "{}",
         serde_json::to_string_pretty(&rows).context("serialize archived video rows")?
@@ -1064,35 +1064,28 @@ fn list(args: DataDirArgs) -> Result<()> {
     Ok(())
 }
 
-fn list_rows(data_dir: &Path) -> Result<Vec<VideoRow>> {
+async fn list_rows(data_dir: &Path) -> Result<Vec<VideoRow>> {
     let rows = Ledger::open_read_only(data_dir)?
         .map(|ledger| ledger.rows())
         .transpose()?
         .unwrap_or_default();
-    Ok(rows
-        .into_iter()
-        .filter(|row| is_archived_row(data_dir, row))
-        .collect::<Vec<_>>())
+    let mut archived = Vec::new();
+    for row in rows {
+        if is_archived_row(data_dir, &row).await {
+            archived.push(row);
+        }
+    }
+    Ok(archived)
 }
 
-fn is_archived_row(data_dir: &Path, row: &VideoRow) -> bool {
+async fn is_archived_row(data_dir: &Path, row: &VideoRow) -> bool {
     row.downloaded_at.is_some()
         && row.transcribed_at.is_some()
         && row.wiki_emitted_at.is_some()
         && row.error.is_none()
-        && row.audio_path.as_deref().is_some_and(|path| {
-            let path = ledger_path_to_fs_path(data_dir, path);
-            path.is_file()
-        })
-        && row.transcript_path.as_deref().is_some_and(|path| {
-            let json_path = ledger_path_to_fs_path(data_dir, path);
-            let txt_path = json_path.with_file_name("transcript.txt");
-            json_path.is_file() && txt_path.is_file()
-        })
-        && row.wiki_path.as_deref().is_some_and(|path| {
-            let path = ledger_path_to_fs_path(data_dir, path);
-            path.is_file()
-        })
+        && async_ledger_path_is_file(data_dir, row.audio_path.as_deref()).await
+        && async_transcript_paths_exist(data_dir, row.transcript_path.as_deref()).await
+        && async_ledger_path_is_file(data_dir, row.wiki_path.as_deref()).await
 }
 
 fn row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<VideoRow> {
@@ -1436,6 +1429,15 @@ async fn async_ledger_path_is_file(data_dir: &Path, path: Option<&str>) -> bool 
         Some(path) => async_fs_path_is_file(ledger_path_to_fs_path(data_dir, path)).await,
         None => false,
     }
+}
+
+async fn async_transcript_paths_exist(data_dir: &Path, path: Option<&str>) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    let json_path = ledger_path_to_fs_path(data_dir, path);
+    let txt_path = json_path.with_file_name("transcript.txt");
+    async_fs_path_is_file(json_path).await && async_fs_path_is_file(txt_path).await
 }
 
 async fn async_fs_path_is_file(path: PathBuf) -> bool {
@@ -3211,8 +3213,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn list_rows_only_include_completed_archived_videos() -> Result<()> {
+    #[tokio::test]
+    async fn list_rows_only_include_completed_archived_videos() -> Result<()> {
         let dir = tempdir()?;
         let ledger = Ledger::open(dir.path())?;
         let complete_id = "dQw4w9WgXcQ";
@@ -3235,15 +3237,15 @@ mod tests {
         ledger.mark_error(failed_id, "download failed")?;
         drop(ledger);
 
-        let rows = list_rows(dir.path())?;
+        let rows = list_rows(dir.path()).await?;
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].video_id, complete_id);
         Ok(())
     }
 
-    #[test]
-    fn list_rows_require_archived_artifacts_to_exist() -> Result<()> {
+    #[tokio::test]
+    async fn list_rows_require_archived_artifacts_to_exist() -> Result<()> {
         let dir = tempdir()?;
         let ledger = Ledger::open(dir.path())?;
         let video_id = "dQw4w9WgXcQ";
@@ -3261,7 +3263,7 @@ mod tests {
         ledger.mark_wiki_emitted(video_id, &wiki)?;
         drop(ledger);
 
-        let rows = list_rows(dir.path())?;
+        let rows = list_rows(dir.path()).await?;
 
         assert!(rows.is_empty());
         Ok(())
