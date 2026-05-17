@@ -839,7 +839,28 @@ async fn load_cached_metadata(video_id: &str, info_path: &Path) -> Result<Option
     }
 
     match serde_json::from_slice::<Value>(&bytes) {
-        Ok(value) => Ok(Some(metadata_from_value(video_id, &value))),
+        Ok(value) => match string_field(&value, &["id"]).as_deref() {
+            Some(cached_id) if cached_id == video_id => {
+                Ok(Some(metadata_from_value(video_id, &value)))
+            }
+            Some(cached_id) => {
+                warn!(
+                    path = %info_path.display(),
+                    expected_video_id = %video_id,
+                    cached_video_id = %cached_id,
+                    "cached metadata video ID mismatch; refetching"
+                );
+                Ok(None)
+            }
+            None => {
+                warn!(
+                    path = %info_path.display(),
+                    expected_video_id = %video_id,
+                    "cached metadata missing video ID; refetching"
+                );
+                Ok(None)
+            }
+        },
         Err(err) => {
             warn!(path = %info_path.display(), error = %err, "cached metadata is invalid JSON; refetching");
             Ok(None)
@@ -2728,7 +2749,7 @@ mod tests {
         let info_path = dir.path().join("info.json");
         fs::write(
             &info_path,
-            br#"{"title":"A Video","channel":"Rust Channel","tags":["rust"]}"#,
+            br#"{"id":"dQw4w9WgXcQ","title":"A Video","channel":"Rust Channel","tags":["rust"]}"#,
         )
         .await?;
 
@@ -2740,6 +2761,22 @@ mod tests {
         assert_eq!(metadata.title.as_deref(), Some("A Video"));
         assert_eq!(metadata.channel_title.as_deref(), Some("Rust Channel"));
         assert_eq!(metadata.tags, vec!["rust".to_owned()]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cached_metadata_rejects_mismatched_video_id() -> Result<()> {
+        let dir = tempdir()?;
+        let info_path = dir.path().join("info.json");
+        fs::write(
+            &info_path,
+            br#"{"id":"abc1234567_","title":"Different Video"}"#,
+        )
+        .await?;
+
+        let metadata = load_cached_metadata("dQw4w9WgXcQ", &info_path).await?;
+
+        assert!(metadata.is_none());
         Ok(())
     }
 
