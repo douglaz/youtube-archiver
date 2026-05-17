@@ -1517,8 +1517,8 @@ async fn run_checked_stream_output(program: &str, args: &[String]) -> Result<Out
         .take()
         .ok_or_else(|| anyhow!("capture stderr for {command}"))?;
 
-    let stream_progress = Arc::new(AtomicU64::new(0));
-    let stdout_progress = Arc::clone(&stream_progress);
+    let stdout_progress = Arc::new(AtomicU64::new(0));
+    let stdout_reader_progress = Arc::clone(&stdout_progress);
     let stdout_task = AbortOnDrop::new(tokio::spawn(async move {
         let mut captured = Vec::new();
         let mut truncated = false;
@@ -1531,7 +1531,7 @@ async fn run_checked_stream_output(program: &str, args: &[String]) -> Result<Out
             if read == 0 {
                 break;
             }
-            stdout_progress.fetch_add(1, Ordering::Relaxed);
+            stdout_reader_progress.fetch_add(1, Ordering::Relaxed);
             if !live_stdout_failed && let Err(err) = live_stdout.write_all(&chunk[..read]).await {
                 live_stdout_failed = true;
                 warn!(stream = "stdout", error = %err, "failed to write child output to live stream");
@@ -1548,7 +1548,8 @@ async fn run_checked_stream_output(program: &str, args: &[String]) -> Result<Out
 
         Ok::<Vec<u8>, std::io::Error>(captured)
     }));
-    let stderr_progress = Arc::clone(&stream_progress);
+    let stderr_progress = Arc::new(AtomicU64::new(0));
+    let stderr_reader_progress = Arc::clone(&stderr_progress);
     let stderr_task = AbortOnDrop::new(tokio::spawn(async move {
         let mut captured = Vec::new();
         let mut truncated = false;
@@ -1561,7 +1562,7 @@ async fn run_checked_stream_output(program: &str, args: &[String]) -> Result<Out
             if read == 0 {
                 break;
             }
-            stderr_progress.fetch_add(1, Ordering::Relaxed);
+            stderr_reader_progress.fetch_add(1, Ordering::Relaxed);
             if !live_stderr_failed && let Err(err) = live_stderr.write_all(&chunk[..read]).await {
                 live_stderr_failed = true;
                 warn!(stream = "stderr", error = %err, "failed to write child output to live stream");
@@ -1583,8 +1584,8 @@ async fn run_checked_stream_output(program: &str, args: &[String]) -> Result<Out
         .wait()
         .await
         .with_context(|| format!("wait for {command}"))?;
-    let stdout = join_stream_reader(stdout_task, "stdout", &command, &stream_progress).await?;
-    let stderr = join_stream_reader(stderr_task, "stderr", &command, &stream_progress).await?;
+    let stdout = join_stream_reader(stdout_task, "stdout", &command, &stdout_progress).await?;
+    let stderr = join_stream_reader(stderr_task, "stderr", &command, &stderr_progress).await?;
 
     let output = Output {
         status,
@@ -3242,6 +3243,28 @@ chmod 555 "$(dirname "$out")"
             .expect_err("leaked stream pipe should time out");
 
         assert!(format!("{err:#}").contains("timed out draining"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streamed_command_times_out_silent_pipe_despite_other_pipe_progress() {
+        let script = concat!(
+            "(for i in 1 2 3 4 5 6 7 8 9 10; do ",
+            "printf tick >&2; sleep 0.05; ",
+            "done) >/dev/null & sleep 1 & exit 0",
+        );
+        let args = vec!["-c".to_owned(), script.to_owned()];
+
+        let result = tokio::time::timeout(
+            STREAM_READER_DRAIN_TIMEOUT * 3,
+            run_checked_stream_output("sh", &args),
+        )
+        .await;
+        let err = result
+            .expect("stdout drain timeout should not be masked by stderr progress")
+            .expect_err("leaked stdout pipe should time out");
+
+        assert!(format!("{err:#}").contains("timed out draining stdout"));
     }
 
     #[tokio::test]
