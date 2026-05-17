@@ -204,6 +204,11 @@ jobs:
         mv release-artifacts/youtube-archiver-linux-binaries/* release-files/
         mv release-artifacts/youtube-archiver-macos-binaries/* release-files/
         mv release-artifacts/youtube-archiver-windows-binaries/* release-files/
+
+        # Bootstrap script for one-command install / auto-update.
+        cp youtube-archiver.sh release-files/
+        chmod +x release-files/youtube-archiver.sh
+
         ls -la release-files/
 
     - name: Create release notes
@@ -236,6 +241,20 @@ jobs:
         On NixOS you can get both from a dev shell of this repo: \`nix develop\`.
 
         ### Installation
+
+        #### Quick install (bootstrap script)
+
+        Drop in the \`youtube-archiver.sh\` wrapper — it detects your platform, downloads the right binary into \`~/.local/bin\`, and self-updates daily:
+
+        \`\`\`bash
+        curl -L https://github.com/${{ github.repository }}/releases/download/latest-master/youtube-archiver.sh -o youtube-archiver
+        chmod +x youtube-archiver
+        ./youtube-archiver --help
+        \`\`\`
+
+        When run from a checked-out repo with a local build under \`target/release\` (or \`target/x86_64-unknown-linux-musl/release\`), the wrapper execs the local binary instead of downloading.
+
+        #### Manual install
 
         1. Download the appropriate archive for your platform.
         2. Extract it.
