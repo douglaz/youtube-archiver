@@ -27,6 +27,10 @@ const DEFAULT_WHISPER_BIN: &str = "nix run nixpkgs#openai-whisper --";
 const DEFAULT_WHISPER_MODEL: &str = "large";
 const DEFAULT_AUDIO_FORMAT: &str = "m4a";
 const STREAMED_OUTPUT_CAPTURE_LIMIT: usize = 64 * 1024;
+#[cfg(not(test))]
+const STREAM_READER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const STREAM_READER_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
 const YOUTUBE_VIDEO_ID_LEN: usize = 11;
 #[cfg(not(target_os = "linux"))]
 const NON_LINUX_STALE_TEMP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
@@ -1398,6 +1402,7 @@ async fn run_checked(program: &str, args: &[String]) -> Result<Output> {
 }
 
 async fn run_checked_stream_output(program: &str, args: &[String]) -> Result<Output> {
+    let command = format_command(program, args);
     let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
@@ -1405,15 +1410,15 @@ async fn run_checked_stream_output(program: &str, args: &[String]) -> Result<Out
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .with_context(|| format!("run {}", format_command(program, args)))?;
+        .with_context(|| format!("run {command}"))?;
     let mut stdout = child
         .stdout
         .take()
-        .ok_or_else(|| anyhow!("capture stdout for {}", format_command(program, args)))?;
+        .ok_or_else(|| anyhow!("capture stdout for {command}"))?;
     let mut stderr = child
         .stderr
         .take()
-        .ok_or_else(|| anyhow!("capture stderr for {}", format_command(program, args)))?;
+        .ok_or_else(|| anyhow!("capture stderr for {command}"))?;
 
     let stdout_task = AbortOnDrop::new(tokio::spawn(async move {
         let mut captured = Vec::new();
@@ -1475,17 +1480,9 @@ async fn run_checked_stream_output(program: &str, args: &[String]) -> Result<Out
     let status = child
         .wait()
         .await
-        .with_context(|| format!("wait for {}", format_command(program, args)))?;
-    let stdout = stdout_task
-        .join()
-        .await
-        .context("join child stdout reader")?
-        .with_context(|| format!("stream stdout from {}", format_command(program, args)))?;
-    let stderr = stderr_task
-        .join()
-        .await
-        .context("join child stderr reader")?
-        .with_context(|| format!("stream stderr from {}", format_command(program, args)))?;
+        .with_context(|| format!("wait for {command}"))?;
+    let stdout = join_stream_reader(stdout_task, "stdout", &command).await?;
+    let stderr = join_stream_reader(stderr_task, "stderr", &command).await?;
 
     let output = Output {
         status,
@@ -1493,6 +1490,18 @@ async fn run_checked_stream_output(program: &str, args: &[String]) -> Result<Out
         stderr,
     };
     ensure_success(program, args, output)
+}
+
+async fn join_stream_reader(
+    task: AbortOnDrop<std::io::Result<Vec<u8>>>,
+    stream_name: &str,
+    command: &str,
+) -> Result<Vec<u8>> {
+    tokio::time::timeout(STREAM_READER_DRAIN_TIMEOUT, task.join())
+        .await
+        .with_context(|| format!("timed out draining {stream_name} from {command}"))?
+        .with_context(|| format!("join child {stream_name} reader"))?
+        .with_context(|| format!("stream {stream_name} from {command}"))
 }
 
 fn push_captured_output(captured: &mut Vec<u8>, chunk: &[u8]) -> bool {
@@ -3014,6 +3023,18 @@ mod tests {
 
         assert!(captured.starts_with(b"[stdout truncated to last "));
         assert_eq!(captured.len(), STREAMED_OUTPUT_CAPTURE_LIMIT);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streamed_command_times_out_when_background_process_keeps_pipe_open() {
+        let args = vec!["-c".to_owned(), "sleep 2 & exit 0".to_owned()];
+
+        let err = run_checked_stream_output("sh", &args)
+            .await
+            .expect_err("leaked stream pipe should time out");
+
+        assert!(format!("{err:#}").contains("timed out draining"));
     }
 
     #[tokio::test]
