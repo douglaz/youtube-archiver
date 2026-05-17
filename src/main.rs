@@ -956,7 +956,7 @@ async fn transcribe_audio(
 ) -> Result<PathBuf> {
     let previous_row = ledger.row(video_id)?;
     if let Some(row) = previous_row.as_ref()
-        && should_skip_transcription_async(data_dir, &row, whisper.model, force).await
+        && should_skip_transcription_async(data_dir, row, whisper.model, force).await
     {
         let transcript_path = row
             .transcript_path
