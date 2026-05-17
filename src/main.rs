@@ -1877,7 +1877,7 @@ async fn should_remove_stage_temp_path(path: &Path, file_name: &str, prefix: &st
         return Ok(false);
     };
     if pid == std::process::id() {
-        return Ok(true);
+        return Ok(false);
     }
 
     should_remove_stage_temp_path_for_pid(path, pid).await
@@ -2941,7 +2941,7 @@ mod tests {
     #[tokio::test]
     async fn cleanup_stage_temp_dirs_removes_previous_stage_dirs() -> Result<()> {
         let dir = tempdir()?;
-        let pid = std::process::id();
+        let pid = u32::MAX;
         let stale = dir.path().join(format!(".download.{pid}.1.0.tmp"));
         let unrelated_dir = dir.path().join(format!(".whisper.{pid}.1.0.tmp"));
         let ordinary_file = dir.path().join(format!(".download.{pid}.2.0.tmp"));
@@ -2954,6 +2954,20 @@ mod tests {
         assert!(!fs::try_exists(&stale).await?);
         assert!(fs::try_exists(&unrelated_dir).await?);
         assert!(fs::try_exists(&ordinary_file).await?);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cleanup_stage_temp_dirs_keeps_current_process_dirs() -> Result<()> {
+        let dir = tempdir()?;
+        let pid = std::process::id();
+        let current = dir.path().join(format!(".download.{pid}.1.0.tmp"));
+        fs::create_dir(&current).await?;
+
+        cleanup_stage_temp_dirs(dir.path(), ".download").await?;
+
+        assert!(fs::try_exists(&current).await?);
         Ok(())
     }
 
@@ -3024,7 +3038,7 @@ mod tests {
         let target = dir.path().join("info.json");
         let stale = dir
             .path()
-            .join(format!(".info.json.{}.1.0.tmp", std::process::id()));
+            .join(format!(".info.json.{}.1.0.tmp", u32::MAX));
         fs::write(&stale, b"stale").await?;
 
         atomic_write(&target, b"fresh").await?;
