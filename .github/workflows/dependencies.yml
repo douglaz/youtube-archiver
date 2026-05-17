@@ -1,0 +1,67 @@
+name: Dependencies
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+  schedule:
+    # Check for outdated dependencies weekly on Mondays at 8 AM UTC
+    - cron: '0 8 * * 1'
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  check-outdated:
+    name: Check Outdated Dependencies
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v6
+
+    - name: Install Nix
+      uses: cachix/install-nix-action@v31
+      with:
+        github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Check for outdated dependencies
+      id: outdated
+      run: |
+        echo "## 📦 Dependency Status Report" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        if nix shell nixpkgs#cargo-outdated -c cargo outdated --exit-code 1 --root-deps-only 2>/dev/null; then
+          echo "✅ All dependencies are up to date!" >> $GITHUB_STEP_SUMMARY
+          echo "status=current" >> $GITHUB_OUTPUT
+        else
+          echo "⚠️ **Outdated dependencies detected:**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          nix shell nixpkgs#cargo-outdated -c cargo outdated --root-deps-only 2>/dev/null >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Update Instructions" >> $GITHUB_STEP_SUMMARY
+          echo "- For compatible updates: \`nix develop -c cargo upgrade\`" >> $GITHUB_STEP_SUMMARY
+          echo "- For major version updates: Review changelogs and update manually" >> $GITHUB_STEP_SUMMARY
+          echo "status=outdated" >> $GITHUB_OUTPUT
+        fi
+      continue-on-error: true
+
+    - name: Generate detailed report
+      run: |
+        nix shell nixpkgs#cargo-outdated -c cargo outdated --format json > outdated-report.json || true
+        echo "Full Dependency Report" > outdated-full-report.txt
+        echo "=====================" >> outdated-full-report.txt
+        echo "" >> outdated-full-report.txt
+        nix shell nixpkgs#cargo-outdated -c cargo outdated 2>/dev/null >> outdated-full-report.txt || true
+      continue-on-error: true
+
+    - name: Upload dependency reports
+      if: always()
+      uses: actions/upload-artifact@v6
+      with:
+        name: dependency-reports
+        path: |
+          outdated-report.json
+          outdated-full-report.txt
+        retention-days: 30
