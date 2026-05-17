@@ -348,6 +348,8 @@ impl Ledger {
                 UPDATE videos
                 SET downloaded_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
                     audio_path = ?2,
+                    transcribed_at = NULL,
+                    wiki_emitted_at = NULL,
                     error = NULL
                 WHERE video_id = ?1
                 "#,
@@ -849,8 +851,8 @@ async fn transcribe_audio(
         let (whisper_json, whisper_txt) = find_whisper_outputs(&tmp_dir, output_stem).await?;
         let final_json = transcript_dir.join("transcript.json");
         let final_txt = transcript_dir.join("transcript.txt");
-        ledger.mark_transcription_started(video_id)?;
         replace_transcript_pair(&whisper_json, &whisper_txt, &final_json, &final_txt).await?;
+        ledger.mark_transcription_started(video_id)?;
         Ok(final_json)
     }
     .await;
@@ -2642,6 +2644,31 @@ mod tests {
 
         assert!(row.wiki_emitted_at.is_none());
         assert!(row.wiki_path.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn marking_downloaded_invalidates_downstream_timestamps() -> Result<()> {
+        let ledger = Ledger::open_in_memory()?;
+        let video_id = "abc123";
+        ledger.ensure_video(video_id, &canonical_video_url(video_id))?;
+        ledger.mark_transcribed(
+            video_id,
+            "large",
+            Path::new("data/transcripts/abc123/transcript.json"),
+        )?;
+        ledger.mark_wiki_emitted(video_id, Path::new("data/wiki/channel/abc123.md"))?;
+
+        let row = ledger.row(video_id)?.expect("row exists");
+        assert!(row.transcribed_at.is_some());
+        assert!(row.wiki_emitted_at.is_some());
+
+        ledger.mark_downloaded(video_id, Path::new("data/media/abc123/audio.opus"))?;
+        let row = ledger.row(video_id)?.expect("row exists");
+
+        assert!(row.downloaded_at.is_some());
+        assert!(row.transcribed_at.is_none());
+        assert!(row.wiki_emitted_at.is_none());
         Ok(())
     }
 
