@@ -76,33 +76,15 @@ fn list_stdout_stays_json_when_ledger_warns() -> Result<(), Box<dyn Error>> {
 }
 
 fn create_ledger_with_bad_tags(data_dir: &Path) -> Result<(), Box<dyn Error>> {
-    std::fs::create_dir_all(data_dir)?;
+    run_success(&[
+        "wiki-ingest".to_owned(),
+        "--data-dir".to_owned(),
+        data_dir.to_string_lossy().into_owned(),
+        "--wiki-ingest-cmd".to_owned(),
+        "sh {path}".to_owned(),
+    ])?;
+
     let conn = Connection::open(data_dir.join("state.sqlite"))?;
-    conn.execute_batch(
-        r#"
-        CREATE TABLE videos (
-            video_id TEXT PRIMARY KEY,
-            url TEXT NOT NULL,
-            channel_id TEXT,
-            channel_title TEXT,
-            uploader TEXT,
-            title TEXT,
-            upload_date TEXT,
-            duration INTEGER,
-            tags TEXT,
-            downloaded_at TEXT,
-            transcribed_at TEXT,
-            wiki_emitted_at TEXT,
-            wiki_ingested_at TEXT,
-            wiki_ingest_cmd TEXT,
-            whisper_model TEXT,
-            audio_path TEXT,
-            transcript_path TEXT,
-            wiki_path TEXT,
-            error TEXT
-        );
-        "#,
-    )?;
     conn.execute(
         "INSERT INTO videos (video_id, url, tags) VALUES (?1, ?2, ?3)",
         params![
