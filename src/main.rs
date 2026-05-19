@@ -1,7 +1,8 @@
 use std::{
     collections::HashSet,
+    env, fmt,
     path::{Path, PathBuf},
-    process::{Output, Stdio},
+    process::{ExitStatus, Output, Stdio},
     sync::{
         Arc, LazyLock,
         atomic::{AtomicU64, Ordering},
@@ -24,9 +25,12 @@ use tracing::{error, info, warn};
 
 const DEFAULT_DATA_DIR: &str = "data";
 const DEFAULT_WHISPER_BIN: &str = "nix run nixpkgs#openai-whisper --";
+const DEFAULT_WIKI_INGEST_CMD: &str = "claude -p \"/wiki:ingest {path}\" --permission-mode acceptEdits --allowedTools \"Bash,Read,Write,Edit,Glob,Grep,Task\"";
 const DEFAULT_WHISPER_MODEL: &str = "large";
 const DEFAULT_AUDIO_FORMAT: &str = "m4a";
+const DEFAULT_WIKI_INGEST_TIMEOUT_SECS: u64 = 600;
 const STREAMED_OUTPUT_CAPTURE_LIMIT: usize = 64 * 1024;
+const WIKI_INGEST_STDERR_CAPTURE_LIMIT: usize = 4 * 1024;
 #[cfg(not(test))]
 const STREAM_READER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
@@ -38,6 +42,10 @@ const NON_LINUX_STALE_TEMP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static SLUG_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[^\p{Alphabetic}\p{Number}]+").expect("slug regex compiles"));
+static MISSING_WIKI_PLUGIN_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(unknown command|plugin.{0,40}(not\s*found|not\s*installed)|/wiki:ingest)")
+        .expect("missing plugin regex compiles")
+});
 
 #[derive(Parser, Debug)]
 #[command(name = "youtube-archiver")]
@@ -51,6 +59,8 @@ struct Cli {
 enum Commands {
     /// Download, transcribe, and emit wiki markdown for a video, channel, or playlist URL.
     Ingest(IngestArgs),
+    /// Ingest emitted wiki markdown into llm-wiki.
+    WikiIngest(WikiIngestCommandArgs),
     /// Print a per-video state table.
     Status(DataDirArgs),
     /// List archived videos as JSON.
@@ -99,6 +109,40 @@ struct DataDirArgs {
     data_dir: PathBuf,
 }
 
+#[derive(Args, Debug)]
+struct WikiIngestCommandArgs {
+    #[arg(long, default_value = DEFAULT_DATA_DIR)]
+    data_dir: PathBuf,
+
+    #[command(flatten)]
+    wiki_ingest: WikiIngestArgs,
+
+    #[arg(long)]
+    video_id: Option<String>,
+
+    #[arg(long)]
+    retry_errors: bool,
+
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+struct WikiIngestArgs {
+    #[arg(long, value_name = "TEMPLATE", value_parser = parse_wiki_ingest_template)]
+    wiki_ingest_cmd: Option<String>,
+
+    #[arg(long)]
+    wiki_ingest_cwd: Option<PathBuf>,
+
+    #[arg(
+        long,
+        default_value_t = DEFAULT_WIKI_INGEST_TIMEOUT_SECS,
+        value_parser = parse_positive_u64
+    )]
+    wiki_ingest_timeout_secs: u64,
+}
+
 fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
     let parsed = value
         .parse::<usize>()
@@ -108,6 +152,43 @@ fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
     } else {
         Ok(parsed)
     }
+}
+
+fn parse_positive_u64(value: &str) -> std::result::Result<u64, String> {
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|err| format!("invalid positive integer: {err}"))?;
+    if parsed == 0 {
+        Err("value must be greater than 0".to_owned())
+    } else {
+        Ok(parsed)
+    }
+}
+
+fn parse_wiki_ingest_template(value: &str) -> std::result::Result<String, String> {
+    validate_wiki_ingest_template(value)?;
+    Ok(value.to_owned())
+}
+
+fn validate_wiki_ingest_template(value: &str) -> std::result::Result<(), String> {
+    if !value.contains("{path}") {
+        return Err("template must contain {path}".to_owned());
+    }
+
+    let values = WikiIngestTemplateValues {
+        path: "/tmp/youtube archiver/wiki/channel/video \"quoted\".md".to_owned(),
+        video_id: "abc123".to_owned(),
+        title: "A \"quoted\" title".to_owned(),
+        channel_slug: "channel slug".to_owned(),
+    };
+    let rendered = render_wiki_ingest_template(value, &values);
+    let argv = shell_words::split(&rendered)
+        .map_err(|err| format!("template must render to a shell-parseable command: {err}"))?;
+    if argv.is_empty() {
+        return Err("template must render to a non-empty command".to_owned());
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,6 +216,68 @@ struct WhisperConfig<'a> {
     model: &'a str,
     extra_args: &'a [String],
 }
+
+#[derive(Debug)]
+struct WikiIngestConfig {
+    template: String,
+    cwd: PathBuf,
+    timeout: Duration,
+}
+
+#[derive(Debug)]
+struct WikiIngestBatchOptions<'a> {
+    video_id: Option<&'a str>,
+    retry_errors: bool,
+    force: bool,
+}
+
+#[derive(Debug, Default)]
+struct WikiIngestBatchOutcome {
+    succeeded: usize,
+    skipped: usize,
+    failed: usize,
+}
+
+#[derive(Debug)]
+struct RenderedWikiIngestCommand {
+    rendered: String,
+    program: String,
+    args: Vec<String>,
+}
+
+#[derive(Debug)]
+struct WikiIngestTemplateValues {
+    path: String,
+    video_id: String,
+    title: String,
+    channel_slug: String,
+}
+
+#[derive(Debug)]
+struct WikiIngestCommandOutput {
+    status: ExitStatus,
+    stderr: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct ExitCodeError {
+    code: i32,
+    message: String,
+}
+
+impl ExitCodeError {
+    fn new(code: i32, message: String) -> Self {
+        Self { code, message }
+    }
+}
+
+impl fmt::Display for ExitCodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ExitCodeError {}
 
 struct AbortOnDrop<T> {
     handle: Option<tokio::task::JoinHandle<T>>,
@@ -562,7 +705,6 @@ impl Ledger {
         Ok(())
     }
 
-    #[cfg(test)]
     fn mark_wiki_ingested(&self, video_id: &str, rendered_cmd: &str) -> Result<()> {
         self.conn
             .execute(
@@ -660,7 +802,7 @@ fn configure_connection(conn: &Connection) -> Result<()> {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
@@ -669,8 +811,21 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    if let Err(err) = run_cli().await {
+        if let Some(exit) = err.downcast_ref::<ExitCodeError>() {
+            eprintln!("{exit}");
+            std::process::exit(exit.code);
+        }
+
+        eprintln!("Error: {err:#}");
+        std::process::exit(1);
+    }
+}
+
+async fn run_cli() -> Result<()> {
     match Cli::parse().command {
         Commands::Ingest(args) => ingest(args).await,
+        Commands::WikiIngest(args) => wiki_ingest(args).await,
         Commands::Status(args) => status(args).await,
         Commands::List(args) => list(args).await,
     }
@@ -1167,6 +1322,442 @@ async fn list(args: DataDirArgs) -> Result<()> {
     Ok(())
 }
 
+async fn wiki_ingest(args: WikiIngestCommandArgs) -> Result<()> {
+    let config = wiki_ingest_config(&args.data_dir, &args.wiki_ingest)?;
+    let ledger = Ledger::open(&args.data_dir)?;
+    run_wiki_ingest_batch(
+        &args.data_dir,
+        &ledger,
+        &config,
+        WikiIngestBatchOptions {
+            video_id: args.video_id.as_deref(),
+            retry_errors: args.retry_errors,
+            force: args.force,
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+fn wiki_ingest_config(data_dir: &Path, args: &WikiIngestArgs) -> Result<WikiIngestConfig> {
+    let template = wiki_ingest_template(args.wiki_ingest_cmd.as_deref())?;
+    let cwd = args
+        .wiki_ingest_cwd
+        .clone()
+        .unwrap_or_else(|| data_dir.join("wiki"));
+    Ok(WikiIngestConfig {
+        template,
+        cwd,
+        timeout: Duration::from_secs(args.wiki_ingest_timeout_secs),
+    })
+}
+
+fn wiki_ingest_template(cli_template: Option<&str>) -> Result<String> {
+    let template = match cli_template {
+        Some(template) => template.to_owned(),
+        None => env::var("YTARCH_WIKI_INGEST_CMD")
+            .unwrap_or_else(|_| DEFAULT_WIKI_INGEST_CMD.to_owned()),
+    };
+    validate_wiki_ingest_template(&template).map_err(|err| anyhow!(err))?;
+    Ok(template)
+}
+
+async fn run_wiki_ingest_batch(
+    data_dir: &Path,
+    ledger: &Ledger,
+    config: &WikiIngestConfig,
+    options: WikiIngestBatchOptions<'_>,
+) -> Result<WikiIngestBatchOutcome> {
+    let rows = wiki_ingest_candidate_rows(
+        ledger,
+        options.video_id,
+        options.retry_errors,
+        options.force,
+    )?;
+    let mut outcome = WikiIngestBatchOutcome::default();
+    if rows.is_empty() {
+        info!("no wiki articles pending ingestion");
+        return Ok(outcome);
+    }
+
+    let preflight_command = render_wiki_ingest_command(data_dir, &config.template, &rows[0])?;
+    preflight_wiki_ingest_command(&preflight_command.program).await?;
+
+    let mut failed_video_ids = Vec::new();
+    let mut attempted_invocations = 0usize;
+    let mut missing_plugin_hint_emitted = false;
+
+    for row in rows {
+        let row = ledger.row(&row.video_id)?.unwrap_or(row);
+        if should_skip_wiki_ingest_async(data_dir, &row, options.force).await {
+            outcome.skipped += 1;
+            info!(video_id = %row.video_id, "wiki ingestion skipped");
+            continue;
+        }
+
+        let result = run_wiki_ingest_row(data_dir, ledger, config, &row).await;
+        match result {
+            Ok(RunWikiIngestRowOutcome::Succeeded) => {
+                attempted_invocations += 1;
+                outcome.succeeded += 1;
+                info!(video_id = %row.video_id, "wiki ingestion completed");
+            }
+            Ok(RunWikiIngestRowOutcome::CommandFailed { status, stderr }) => {
+                attempted_invocations += 1;
+                outcome.failed += 1;
+                failed_video_ids.push(row.video_id.clone());
+                let stderr_tail = stderr_tail_one_line(&stderr);
+                if attempted_invocations == 1
+                    && !missing_plugin_hint_emitted
+                    && is_missing_wiki_plugin_error(&stderr_tail)
+                {
+                    eprintln!("{}", wiki_ingest_install_hint());
+                    missing_plugin_hint_emitted = true;
+                }
+                let message = format!(
+                    "wiki-ingest exited {}: {}",
+                    exit_status_code(&status),
+                    stderr_tail
+                );
+                error!(video_id = %row.video_id, error = %message, "wiki ingestion failed");
+                if let Err(err) = ledger.mark_error(&row.video_id, &message) {
+                    warn!(video_id = %row.video_id, error = %err, original_error = %message, "failed to record wiki ingestion error in ledger");
+                }
+            }
+            Err(err) => {
+                outcome.failed += 1;
+                failed_video_ids.push(row.video_id.clone());
+                let message = one_line_error(&err);
+                error!(video_id = %row.video_id, error = %message, "wiki ingestion failed");
+                if let Err(err) = ledger.mark_error(&row.video_id, &message) {
+                    warn!(video_id = %row.video_id, error = %err, original_error = %message, "failed to record wiki ingestion error in ledger");
+                }
+            }
+        }
+    }
+
+    if outcome.succeeded + outcome.skipped == 0 && outcome.failed > 0 {
+        bail!(
+            "every wiki ingestion failed ({} failure(s)): {}",
+            outcome.failed,
+            failed_video_ids.join(", ")
+        );
+    }
+
+    Ok(outcome)
+}
+
+#[derive(Debug)]
+enum RunWikiIngestRowOutcome {
+    Succeeded,
+    CommandFailed { status: ExitStatus, stderr: Vec<u8> },
+}
+
+async fn run_wiki_ingest_row(
+    data_dir: &Path,
+    ledger: &Ledger,
+    config: &WikiIngestConfig,
+    row: &VideoRow,
+) -> Result<RunWikiIngestRowOutcome> {
+    let wiki_path = wiki_path_from_row(data_dir, row)?;
+    if !async_fs_path_is_file(wiki_path.clone()).await {
+        bail!("wiki file is missing on disk: {}", wiki_path.display());
+    }
+
+    let command = render_wiki_ingest_command(data_dir, &config.template, row)?;
+    let output = run_wiki_ingest_command(&command, &config.cwd, config.timeout).await?;
+    if output.status.success() {
+        ledger.mark_wiki_ingested(&row.video_id, &command.rendered)?;
+        Ok(RunWikiIngestRowOutcome::Succeeded)
+    } else {
+        Ok(RunWikiIngestRowOutcome::CommandFailed {
+            status: output.status,
+            stderr: output.stderr,
+        })
+    }
+}
+
+fn wiki_ingest_candidate_rows(
+    ledger: &Ledger,
+    video_id: Option<&str>,
+    retry_errors: bool,
+    force: bool,
+) -> Result<Vec<VideoRow>> {
+    let rows = match video_id {
+        Some(video_id) => ledger.row(video_id)?.into_iter().collect(),
+        None => ledger.rows()?,
+    };
+
+    Ok(rows
+        .into_iter()
+        .filter(|row| row.wiki_emitted_at.is_some())
+        .filter(|row| force || row.wiki_ingested_at.is_none())
+        .filter(|row| retry_errors || row.error.is_none())
+        .collect())
+}
+
+fn render_wiki_ingest_command(
+    data_dir: &Path,
+    template: &str,
+    row: &VideoRow,
+) -> Result<RenderedWikiIngestCommand> {
+    let values = wiki_ingest_template_values(data_dir, row)?;
+    let rendered = render_wiki_ingest_template(template, &values);
+    let argv = shell_words::split(&rendered).context("parse rendered wiki ingestion command")?;
+    let (program, args) = argv
+        .split_first()
+        .ok_or_else(|| anyhow!("wiki ingestion command must not be empty"))?;
+    Ok(RenderedWikiIngestCommand {
+        rendered,
+        program: program.to_owned(),
+        args: args.to_vec(),
+    })
+}
+
+fn render_wiki_ingest_template(template: &str, values: &WikiIngestTemplateValues) -> String {
+    let mut rendered = String::with_capacity(template.len());
+    let mut rest = template;
+
+    while let Some(index) = rest.find('{') {
+        rendered.push_str(&rest[..index]);
+        let token_start = &rest[index..];
+        if let Some((token, value)) = wiki_ingest_template_token(token_start, values) {
+            rendered.push_str(&shell_words::quote(value));
+            rest = &token_start[token.len()..];
+        } else {
+            rendered.push('{');
+            rest = &token_start[1..];
+        }
+    }
+    rendered.push_str(rest);
+    rendered
+}
+
+fn wiki_ingest_template_token<'a>(
+    value: &str,
+    values: &'a WikiIngestTemplateValues,
+) -> Option<(&'static str, &'a str)> {
+    if value.starts_with("{path}") {
+        Some(("{path}", &values.path))
+    } else if value.starts_with("{video_id}") {
+        Some(("{video_id}", &values.video_id))
+    } else if value.starts_with("{title}") {
+        Some(("{title}", &values.title))
+    } else if value.starts_with("{channel_slug}") {
+        Some(("{channel_slug}", &values.channel_slug))
+    } else {
+        None
+    }
+}
+
+fn wiki_ingest_template_values(
+    data_dir: &Path,
+    row: &VideoRow,
+) -> Result<WikiIngestTemplateValues> {
+    let wiki_path = wiki_path_from_row(data_dir, row)?;
+    let absolute_wiki_path = absolutize_path(&wiki_path)?;
+    Ok(WikiIngestTemplateValues {
+        path: path_to_string(&absolute_wiki_path),
+        video_id: row.video_id.clone(),
+        title: row.title.clone().unwrap_or_default(),
+        channel_slug: channel_slug_from_wiki_path(&wiki_path),
+    })
+}
+
+fn wiki_path_from_row(data_dir: &Path, row: &VideoRow) -> Result<PathBuf> {
+    let path = row
+        .wiki_path
+        .as_deref()
+        .ok_or_else(|| anyhow!("ledger row for {} has no wiki_path", row.video_id))?;
+    Ok(ledger_path_to_fs_path(data_dir, path))
+}
+
+fn channel_slug_from_wiki_path(path: &Path) -> String {
+    path.parent()
+        .and_then(Path::file_name)
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_owned()
+}
+
+async fn preflight_wiki_ingest_command(program: &str) -> Result<()> {
+    let status = Command::new("sh")
+        .args(["-c", "command -v \"$1\" >/dev/null", "command", program])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .status()
+        .await
+        .context("run command -v for wiki ingestion command")?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(ExitCodeError::new(
+            3,
+            format!(
+                "error: wiki ingestion command not found: '{}'\n{}",
+                program,
+                wiki_ingest_install_hint()
+            ),
+        )
+        .into())
+    }
+}
+
+fn wiki_ingest_install_hint() -> &'static str {
+    "hint: install Claude Code (https://docs.claude.com/en/docs/claude-code/quickstart)\n      then run: claude plugin install wiki@llm-wiki\n      or override with --wiki-ingest-cmd '<your command>'"
+}
+
+async fn run_wiki_ingest_command(
+    command: &RenderedWikiIngestCommand,
+    cwd: &Path,
+    timeout: Duration,
+) -> Result<WikiIngestCommandOutput> {
+    let mut child = Command::new(&command.program)
+        .args(&command.args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("run {}", command.rendered))?;
+
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("capture stdout for {}", command.rendered))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("capture stderr for {}", command.rendered))?;
+    let stdout_progress = Arc::new(AtomicU64::new(0));
+    let stdout_reader_progress = Arc::clone(&stdout_progress);
+    let stdout_task = AbortOnDrop::new(tokio::spawn(async move {
+        let mut captured = Vec::new();
+        let mut truncated = false;
+        let mut chunk = [0u8; 8192];
+        let mut live_stdout = tokio::io::stdout();
+        let mut live_stdout_failed = false;
+
+        loop {
+            let read = stdout.read(&mut chunk).await?;
+            if read == 0 {
+                break;
+            }
+            stdout_reader_progress.fetch_add(1, Ordering::Relaxed);
+            if !live_stdout_failed {
+                match live_stdout.write_all(&chunk[..read]).await {
+                    Ok(()) => {}
+                    Err(err) => {
+                        live_stdout_failed = true;
+                        warn!(stream = "stdout", error = %err, "failed to write child output to live stream");
+                    }
+                }
+            }
+            truncated |= push_captured_output(&mut captured, &chunk[..read]);
+        }
+        if !live_stdout_failed {
+            match live_stdout.flush().await {
+                Ok(()) => {}
+                Err(err) => {
+                    warn!(stream = "stdout", error = %err, "failed to flush child output live stream");
+                }
+            }
+        }
+
+        if truncated {
+            add_truncation_notice(&mut captured, "stdout");
+        }
+
+        Ok::<Vec<u8>, std::io::Error>(captured)
+    }));
+    let stderr_progress = Arc::new(AtomicU64::new(0));
+    let stderr_reader_progress = Arc::clone(&stderr_progress);
+    let stderr_task = AbortOnDrop::new(tokio::spawn(async move {
+        let mut captured = Vec::new();
+        let mut chunk = [0u8; 8192];
+        let mut live_stderr = tokio::io::stderr();
+        let mut live_stderr_failed = false;
+
+        loop {
+            let read = stderr.read(&mut chunk).await?;
+            if read == 0 {
+                break;
+            }
+            stderr_reader_progress.fetch_add(1, Ordering::Relaxed);
+            if !live_stderr_failed && let Err(err) = live_stderr.write_all(&chunk[..read]).await {
+                live_stderr_failed = true;
+                warn!(stream = "stderr", error = %err, "failed to write child output to live stream");
+            }
+            push_captured_output_with_limit(
+                &mut captured,
+                &chunk[..read],
+                WIKI_INGEST_STDERR_CAPTURE_LIMIT,
+            );
+        }
+        if !live_stderr_failed && let Err(err) = live_stderr.flush().await {
+            warn!(stream = "stderr", error = %err, "failed to flush child output live stream");
+        }
+
+        Ok::<Vec<u8>, std::io::Error>(captured)
+    }));
+
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(status) => status.with_context(|| format!("wait for {}", command.rendered))?,
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            let _stdout =
+                join_stream_reader(stdout_task, "stdout", &command.rendered, &stdout_progress)
+                    .await?;
+            let stderr =
+                join_stream_reader(stderr_task, "stderr", &command.rendered, &stderr_progress)
+                    .await?;
+            bail!(
+                "wiki-ingest timed out after {}s: {}",
+                timeout.as_secs(),
+                stderr_tail_one_line(&stderr)
+            );
+        }
+    };
+    let _stdout =
+        join_stream_reader(stdout_task, "stdout", &command.rendered, &stdout_progress).await?;
+    let stderr =
+        join_stream_reader(stderr_task, "stderr", &command.rendered, &stderr_progress).await?;
+
+    Ok(WikiIngestCommandOutput { status, stderr })
+}
+
+fn exit_status_code(status: &ExitStatus) -> String {
+    status
+        .code()
+        .map_or_else(|| status.to_string(), |code| code.to_string())
+}
+
+fn stderr_tail_one_line(stderr: &[u8]) -> String {
+    let tail = String::from_utf8_lossy(stderr);
+    let tail = tail.split_whitespace().collect::<Vec<_>>().join(" ");
+    if tail.is_empty() {
+        "(no stderr)".to_owned()
+    } else {
+        tail
+    }
+}
+
+fn one_line_error(err: &anyhow::Error) -> String {
+    format!("{err:#}")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn is_missing_wiki_plugin_error(stderr_tail: &str) -> bool {
+    MISSING_WIKI_PLUGIN_RE.is_match(stderr_tail)
+}
+
 async fn list_rows(data_dir: &Path) -> Result<Vec<VideoRow>> {
     let rows = Ledger::open_read_only(data_dir)?
         .map(|ledger| ledger.rows())
@@ -1529,6 +2120,22 @@ async fn should_skip_wiki_async(data_dir: &Path, row: &VideoRow, force: bool) ->
         && async_ledger_path_is_file(data_dir, row.wiki_path.as_deref()).await
 }
 
+#[cfg(test)]
+fn should_skip_wiki_ingest(data_dir: &Path, row: &VideoRow, force: bool) -> bool {
+    !force
+        && row.wiki_ingested_at.is_some()
+        && row
+            .wiki_path
+            .as_deref()
+            .is_some_and(|path| ledger_path_to_fs_path(data_dir, path).is_file())
+}
+
+async fn should_skip_wiki_ingest_async(data_dir: &Path, row: &VideoRow, force: bool) -> bool {
+    !force
+        && row.wiki_ingested_at.is_some()
+        && async_ledger_path_is_file(data_dir, row.wiki_path.as_deref()).await
+}
+
 async fn async_ledger_path_is_file(data_dir: &Path, path: Option<&str>) -> bool {
     match path {
         Some(path) => async_fs_path_is_file(ledger_path_to_fs_path(data_dir, path)).await,
@@ -1728,15 +2335,19 @@ async fn join_stream_reader(
 }
 
 fn push_captured_output(captured: &mut Vec<u8>, chunk: &[u8]) -> bool {
-    if chunk.len() > STREAMED_OUTPUT_CAPTURE_LIMIT {
+    push_captured_output_with_limit(captured, chunk, STREAMED_OUTPUT_CAPTURE_LIMIT)
+}
+
+fn push_captured_output_with_limit(captured: &mut Vec<u8>, chunk: &[u8], limit: usize) -> bool {
+    if chunk.len() > limit {
         captured.clear();
-        captured.extend_from_slice(&chunk[chunk.len() - STREAMED_OUTPUT_CAPTURE_LIMIT..]);
+        captured.extend_from_slice(&chunk[chunk.len() - limit..]);
         return true;
     }
 
     let mut truncated = false;
-    if captured.len() + chunk.len() > STREAMED_OUTPUT_CAPTURE_LIMIT {
-        let excess = captured.len() + chunk.len() - STREAMED_OUTPUT_CAPTURE_LIMIT;
+    if captured.len() + chunk.len() > limit {
+        let excess = captured.len() + chunk.len() - limit;
         captured.drain(..excess);
         truncated = true;
     }
@@ -2633,6 +3244,75 @@ mod tests {
             panic!("expected ingest command");
         };
         assert_eq!(args.whisper_args, ["--language", "en"]);
+    }
+
+    #[test]
+    fn parse_wiki_ingest_cmd_rejects_templates_without_path() {
+        let result = Cli::try_parse_from([
+            "youtube-archiver",
+            "wiki-ingest",
+            "--wiki-ingest-cmd",
+            "claude -p /wiki:ingest",
+        ]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_wiki_ingest_cmd_rejects_shell_unparseable_templates() {
+        let result = Cli::try_parse_from([
+            "youtube-archiver",
+            "wiki-ingest",
+            "--wiki-ingest-cmd",
+            "claude -p \"/wiki:ingest {path}",
+        ]);
+
+        let err = result.expect_err("unclosed quote should fail clap validation");
+        assert!(err.to_string().contains("shell-parseable command"));
+    }
+
+    #[test]
+    fn render_wiki_ingest_template_substitutes_and_quotes_tokens() -> Result<()> {
+        let values = WikiIngestTemplateValues {
+            path: "/tmp/wiki dir/{video_id}/video's file.md".to_owned(),
+            video_id: "abc123".to_owned(),
+            title: "A \"quoted\" {path} title".to_owned(),
+            channel_slug: "rust channel".to_owned(),
+        };
+        let template = "cmd {path} {video_id} {title} {channel_slug}";
+
+        let rendered = render_wiki_ingest_template(template, &values);
+
+        assert_eq!(
+            rendered,
+            format!(
+                "cmd {} abc123 {} {}",
+                shell_words::quote(&values.path),
+                shell_words::quote(&values.title),
+                shell_words::quote(&values.channel_slug)
+            )
+        );
+        let argv = shell_words::split(&rendered)?;
+        assert_eq!(argv[1], values.path);
+        assert_eq!(argv[2], values.video_id);
+        assert_eq!(argv[3], values.title);
+        assert_eq!(argv[4], values.channel_slug);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_wiki_plugin_classifier_matches_expected_phrases() {
+        assert!(is_missing_wiki_plugin_error(
+            "unknown command: /wiki:ingest"
+        ));
+        assert!(is_missing_wiki_plugin_error("plugin wiki not found"));
+        assert!(is_missing_wiki_plugin_error(
+            "Plugin wiki was not installed for this session"
+        ));
+        assert!(is_missing_wiki_plugin_error("failed to run /wiki:ingest"));
+        assert!(!is_missing_wiki_plugin_error(
+            "network timeout while reading file"
+        ));
     }
 
     #[test]
@@ -3666,6 +4346,138 @@ chmod 555 "$(dirname "$out")"
         assert!(should_skip_wiki(dir.path(), &row, false));
         assert!(!should_skip_wiki(dir.path(), &row, true));
 
+        assert!(!should_skip_wiki_ingest(dir.path(), &row, false));
+        ledger.mark_wiki_ingested(video_id, "claude -p /wiki:ingest")?;
+        row = ledger.row(video_id)?.expect("row exists");
+        assert!(should_skip_wiki_ingest(dir.path(), &row, false));
+        assert!(!should_skip_wiki_ingest(dir.path(), &row, true));
+        std::fs::remove_file(&wiki)?;
+        assert!(!should_skip_wiki_ingest(dir.path(), &row, false));
+
+        let wiki_dir = dir.path().join("wiki-ingest-dir.md");
+        std::fs::create_dir(&wiki_dir)?;
+        ledger.mark_wiki_emitted(video_id, &wiki_dir)?;
+        ledger.mark_wiki_ingested(video_id, "claude -p /wiki:ingest")?;
+        row = ledger.row(video_id)?.expect("row exists");
+        assert!(!should_skip_wiki_ingest(dir.path(), &row, false));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wiki_ingest_engine_records_success_skip_force_and_failure() -> Result<()> {
+        let dir = tempdir()?;
+        let ledger = Ledger::open(dir.path())?;
+        let video_id = "abc123";
+        let wiki = dir.path().join("wiki").join("foo").join("abc123.md");
+        let counter = dir.path().join("counter");
+        write_test_file(&wiki, b"wiki")?;
+        ledger.upsert_metadata(&VideoMetadata {
+            video_id: video_id.to_owned(),
+            url: canonical_video_url(video_id),
+            channel_id: None,
+            channel_title: Some("Foo".to_owned()),
+            uploader: None,
+            title: Some("A Title".to_owned()),
+            upload_date: None,
+            duration: None,
+            tags: Vec::new(),
+        })?;
+        ledger.mark_wiki_emitted(video_id, &wiki)?;
+
+        let template = format!(
+            "sh -c \"test -f {{path}} && printf x >> {}\"",
+            shell_words::quote(&path_to_string(&counter))
+        );
+        let config = WikiIngestConfig {
+            template,
+            cwd: dir.path().join("wiki"),
+            timeout: Duration::from_secs(5),
+        };
+
+        let outcome = run_wiki_ingest_batch(
+            dir.path(),
+            &ledger,
+            &config,
+            WikiIngestBatchOptions {
+                video_id: None,
+                retry_errors: false,
+                force: false,
+            },
+        )
+        .await?;
+        assert_eq!(outcome.succeeded, 1);
+        assert_eq!(std::fs::read(&counter)?, b"x");
+        let first = ledger.row(video_id)?.expect("row exists");
+        let first_ingested_at = first.wiki_ingested_at.clone();
+        assert!(first_ingested_at.is_some());
+        assert!(first.wiki_ingest_cmd.as_deref().is_some_and(|cmd| {
+            cmd.contains("test -f")
+                && cmd.contains(&path_to_string(&absolutize_path(&wiki).unwrap()))
+        }));
+
+        let outcome = run_wiki_ingest_batch(
+            dir.path(),
+            &ledger,
+            &config,
+            WikiIngestBatchOptions {
+                video_id: None,
+                retry_errors: false,
+                force: false,
+            },
+        )
+        .await?;
+        assert_eq!(outcome.succeeded + outcome.skipped + outcome.failed, 0);
+        assert_eq!(std::fs::read(&counter)?, b"x");
+        assert_eq!(
+            ledger.row(video_id)?.expect("row exists").wiki_ingested_at,
+            first_ingested_at
+        );
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let outcome = run_wiki_ingest_batch(
+            dir.path(),
+            &ledger,
+            &config,
+            WikiIngestBatchOptions {
+                video_id: None,
+                retry_errors: false,
+                force: true,
+            },
+        )
+        .await?;
+        assert_eq!(outcome.succeeded, 1);
+        assert_eq!(std::fs::read(&counter)?, b"xx");
+        let forced = ledger.row(video_id)?.expect("row exists");
+        assert_ne!(forced.wiki_ingested_at, first_ingested_at);
+
+        let failing = WikiIngestConfig {
+            template: "false {path}".to_owned(),
+            cwd: dir.path().join("wiki"),
+            timeout: Duration::from_secs(5),
+        };
+        let err = run_wiki_ingest_batch(
+            dir.path(),
+            &ledger,
+            &failing,
+            WikiIngestBatchOptions {
+                video_id: None,
+                retry_errors: true,
+                force: true,
+            },
+        )
+        .await
+        .expect_err("failing command should fail the batch");
+
+        assert!(format!("{err:#}").contains("every wiki ingestion failed"));
+        let failed = ledger.row(video_id)?.expect("row exists");
+        assert!(
+            failed
+                .error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("wiki-ingest exited 1:"))
+        );
+        assert_eq!(std::fs::read(&wiki)?, b"wiki");
         Ok(())
     }
 }
