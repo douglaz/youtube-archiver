@@ -93,6 +93,8 @@ fn create_ledger_with_bad_tags(data_dir: &Path) -> Result<(), Box<dyn Error>> {
             downloaded_at TEXT,
             transcribed_at TEXT,
             wiki_emitted_at TEXT,
+            wiki_ingested_at TEXT,
+            wiki_ingest_cmd TEXT,
             whisper_model TEXT,
             audio_path TEXT,
             transcript_path TEXT,

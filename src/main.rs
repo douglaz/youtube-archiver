@@ -178,6 +178,8 @@ struct VideoRow {
     downloaded_at: Option<String>,
     transcribed_at: Option<String>,
     wiki_emitted_at: Option<String>,
+    wiki_ingested_at: Option<String>,
+    wiki_ingest_cmd: Option<String>,
     whisper_model: Option<String>,
     audio_path: Option<String>,
     transcript_path: Option<String>,
@@ -251,6 +253,16 @@ const LEDGER_COLUMNS: &[LedgerColumn] = &[
         name: "wiki_emitted_at",
         create_sql: "wiki_emitted_at TEXT",
         migration_sql: None,
+    },
+    LedgerColumn {
+        name: "wiki_ingested_at",
+        create_sql: "wiki_ingested_at TEXT",
+        migration_sql: Some("ALTER TABLE videos ADD COLUMN wiki_ingested_at TEXT"),
+    },
+    LedgerColumn {
+        name: "wiki_ingest_cmd",
+        create_sql: "wiki_ingest_cmd TEXT",
+        migration_sql: Some("ALTER TABLE videos ADD COLUMN wiki_ingest_cmd TEXT"),
     },
     LedgerColumn {
         name: "whisper_model",
@@ -447,6 +459,8 @@ impl Ledger {
                     audio_path = ?2,
                     transcribed_at = NULL,
                     wiki_emitted_at = NULL,
+                    wiki_ingested_at = NULL,
+                    wiki_ingest_cmd = NULL,
                     error = NULL
                 WHERE video_id = ?1
                 "#,
@@ -472,6 +486,8 @@ impl Ledger {
                     transcript_path = ?3,
                     -- Preserve wiki_path so re-emission can remove stale slug paths.
                     wiki_emitted_at = NULL,
+                    wiki_ingested_at = NULL,
+                    wiki_ingest_cmd = NULL,
                     error = NULL
                 WHERE video_id = ?1
                 "#,
@@ -487,7 +503,9 @@ impl Ledger {
                 r#"
                 UPDATE videos
                 SET transcribed_at = NULL,
-                    wiki_emitted_at = NULL
+                    wiki_emitted_at = NULL,
+                    wiki_ingested_at = NULL,
+                    wiki_ingest_cmd = NULL
                 WHERE video_id = ?1
                 "#,
                 params![video_id],
@@ -505,7 +523,9 @@ impl Ledger {
                     wiki_emitted_at = ?3,
                     whisper_model = ?4,
                     transcript_path = ?5,
-                    wiki_path = ?6
+                    wiki_path = ?6,
+                    wiki_ingested_at = ?7,
+                    wiki_ingest_cmd = ?8
                 WHERE video_id = ?1
                 "#,
                 params![
@@ -514,7 +534,9 @@ impl Ledger {
                     row.wiki_emitted_at,
                     row.whisper_model,
                     row.transcript_path,
-                    row.wiki_path
+                    row.wiki_path,
+                    row.wiki_ingested_at,
+                    row.wiki_ingest_cmd
                 ],
             )
             .with_context(|| format!("restore transcription outputs for {}", row.video_id))?;
@@ -529,12 +551,31 @@ impl Ledger {
                 UPDATE videos
                 SET wiki_emitted_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
                     wiki_path = ?2,
+                    wiki_ingested_at = NULL,
+                    wiki_ingest_cmd = NULL,
                     error = NULL
                 WHERE video_id = ?1
                 "#,
                 params![video_id, wiki_path],
             )
             .with_context(|| format!("mark {video_id} wiki emitted"))?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn mark_wiki_ingested(&self, video_id: &str, rendered_cmd: &str) -> Result<()> {
+        self.conn
+            .execute(
+                r#"
+                UPDATE videos
+                SET wiki_ingested_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                    wiki_ingest_cmd = ?2,
+                    error = NULL
+                WHERE video_id = ?1
+                "#,
+                params![video_id, rendered_cmd],
+            )
+            .with_context(|| format!("mark {video_id} wiki ingested"))?;
         Ok(())
     }
 
@@ -565,6 +606,7 @@ impl Ledger {
                 SELECT video_id, url, channel_id, channel_title, uploader, title,
                        upload_date, duration, tags,
                        downloaded_at, transcribed_at, wiki_emitted_at,
+                       wiki_ingested_at, wiki_ingest_cmd,
                        whisper_model, audio_path, transcript_path, wiki_path, error
                 FROM videos
                 WHERE video_id = ?1
@@ -584,6 +626,7 @@ impl Ledger {
                 SELECT video_id, url, channel_id, channel_title, uploader, title,
                        upload_date, duration, tags,
                        downloaded_at, transcribed_at, wiki_emitted_at,
+                       wiki_ingested_at, wiki_ingest_cmd,
                        whisper_model, audio_path, transcript_path, wiki_path, error
                 FROM videos
                 ORDER BY video_id
@@ -1170,11 +1213,13 @@ fn row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<VideoRow> {
         downloaded_at: row.get(9)?,
         transcribed_at: row.get(10)?,
         wiki_emitted_at: row.get(11)?,
-        whisper_model: row.get(12)?,
-        audio_path: row.get(13)?,
-        transcript_path: row.get(14)?,
-        wiki_path: row.get(15)?,
-        error: row.get(16)?,
+        wiki_ingested_at: row.get(12)?,
+        wiki_ingest_cmd: row.get(13)?,
+        whisper_model: row.get(14)?,
+        audio_path: row.get(15)?,
+        transcript_path: row.get(16)?,
+        wiki_path: row.get(17)?,
+        error: row.get(18)?,
     })
 }
 
@@ -2390,6 +2435,8 @@ mod tests {
             downloaded_at: None,
             transcribed_at: None,
             wiki_emitted_at: None,
+            wiki_ingested_at: None,
+            wiki_ingest_cmd: None,
             whisper_model: None,
             audio_path: None,
             transcript_path: None,
@@ -2788,6 +2835,65 @@ mod tests {
             .expect_err("unknown migration column should be rejected");
 
         assert!(format!("{err:#}").contains("unsupported ledger migration column"));
+        Ok(())
+    }
+
+    #[test]
+    fn ledger_migrates_wiki_ingest_columns() -> Result<()> {
+        let dir = tempdir()?;
+        std::fs::create_dir_all(dir.path())?;
+        let conn = Connection::open(dir.path().join("state.sqlite"))?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE videos (
+                video_id TEXT PRIMARY KEY,
+                url TEXT NOT NULL,
+                channel_id TEXT,
+                channel_title TEXT,
+                uploader TEXT,
+                title TEXT,
+                upload_date TEXT,
+                duration INTEGER,
+                tags TEXT,
+                downloaded_at TEXT,
+                transcribed_at TEXT,
+                wiki_emitted_at TEXT,
+                whisper_model TEXT,
+                audio_path TEXT,
+                transcript_path TEXT,
+                wiki_path TEXT,
+                error TEXT
+            );
+            INSERT INTO videos (video_id, url)
+            VALUES ('abc123', 'https://www.youtube.com/watch?v=abc123');
+            "#,
+        )?;
+        drop(conn);
+
+        let ledger = Ledger::open(dir.path())?;
+        let row = ledger.row("abc123")?.expect("row exists");
+
+        assert!(row.wiki_ingested_at.is_none());
+        assert!(row.wiki_ingest_cmd.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn mark_wiki_ingested_sets_columns_and_clears_error() -> Result<()> {
+        let ledger = Ledger::open_in_memory()?;
+        let video_id = "abc123";
+        ledger.ensure_video(video_id, &canonical_video_url(video_id))?;
+        ledger.mark_error(video_id, "previous failure")?;
+
+        ledger.mark_wiki_ingested(video_id, "claude -p '/wiki:ingest path'")?;
+        let row = ledger.row(video_id)?.expect("row exists");
+
+        assert!(row.wiki_ingested_at.is_some());
+        assert_eq!(
+            row.wiki_ingest_cmd.as_deref(),
+            Some("claude -p '/wiki:ingest path'")
+        );
+        assert!(row.error.is_none());
         Ok(())
     }
 
