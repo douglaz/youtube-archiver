@@ -247,17 +247,37 @@ fn validate_wiki_ingest_template(value: &str) -> std::result::Result<(), String>
         return Err("template must contain {path}".to_owned());
     }
 
-    let values = WikiIngestTemplateValues {
-        path: "/tmp/youtube archiver/wiki/channel/video \"quoted\".md".to_owned(),
+    let values_a = WikiIngestTemplateValues {
+        path: "/tmp/youtube archiver/wiki/channel-a/video \"quoted\".md".to_owned(),
         video_id: "abc123".to_owned(),
         title: "A \"quoted\" title".to_owned(),
-        channel_slug: "channel slug".to_owned(),
+        channel_slug: "channel-a".to_owned(),
     };
-    let rendered = render_wiki_ingest_template(value, &values);
-    let argv = shell_words::split(&rendered)
+    let rendered_a = render_wiki_ingest_template(value, &values_a);
+    let argv_a = shell_words::split(&rendered_a)
         .map_err(|err| format!("template must render to a shell-parseable command: {err}"))?;
-    if argv.is_empty() {
+    if argv_a.is_empty() {
         return Err("template must render to a non-empty command".to_owned());
+    }
+
+    // The preflight `command -v` check renders the template with the
+    // first candidate row's metadata. If argv[0] varies per row (e.g.
+    // a template like `~/scripts/{channel_slug}-ingest.sh {path}`),
+    // preflight succeeds for one row and silently faults mid-batch on
+    // a row with a different channel/title. Reject such templates.
+    let values_b = WikiIngestTemplateValues {
+        path: "/var/tmp/different/wiki/channel-b/other.md".to_owned(),
+        video_id: "zyx987".to_owned(),
+        title: "Different title".to_owned(),
+        channel_slug: "channel-b".to_owned(),
+    };
+    let rendered_b = render_wiki_ingest_template(value, &values_b);
+    let argv_b = shell_words::split(&rendered_b)
+        .map_err(|err| format!("template must render to a shell-parseable command: {err}"))?;
+    if argv_b.first() != argv_a.first() {
+        return Err(
+            "template's program (first token) must not reference {path}, {video_id}, {title}, or {channel_slug}; preflight cannot check a command that varies per video".to_owned(),
+        );
     }
 
     Ok(())
@@ -1223,6 +1243,7 @@ async fn ingest(args: IngestArgs, interrupts: &Interrupts) -> Result<()> {
     ensure_resolved_videos(&ledger, &video_ids)?;
 
     let mut succeeded = 0usize;
+    let mut skipped = 0usize;
     let mut failed = 0usize;
     let mut failed_video_ids = Vec::new();
     let mut missing_plugin_hint_emitted = false;
@@ -1239,9 +1260,13 @@ async fn ingest(args: IngestArgs, interrupts: &Interrupts) -> Result<()> {
         )
         .await
         {
-            Ok(()) => {
+            Ok(ProcessVideoOutcome::Worked) => {
                 succeeded += 1;
                 info!(%video_id, "video processed");
+            }
+            Ok(ProcessVideoOutcome::Skipped) => {
+                skipped += 1;
+                info!(%video_id, "video already complete, nothing to do");
             }
             Err(err) => {
                 if is_interrupted_error(&err) {
@@ -1261,14 +1286,25 @@ async fn ingest(args: IngestArgs, interrupts: &Interrupts) -> Result<()> {
     }
 
     interrupts.check()?;
-    if succeeded == 0 {
+    // Match `wiki-ingest` semantics: only bail when every video that
+    // actually needed work failed. A run consisting entirely of skips
+    // (with no failures) is a successful no-op.
+    if succeeded == 0 && failed > 0 {
         bail!(
-            "every video failed ({failed} failure(s)): {}",
+            "every video failed ({failed} failure(s), {skipped} already complete): {}",
             failed_video_ids.join(", ")
         );
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessVideoOutcome {
+    /// At least one pipeline stage advanced the ledger.
+    Worked,
+    /// Every stage was already complete; this run was a no-op for this video.
+    Skipped,
 }
 
 fn reject_ignored_wiki_ingest_options(args: &IngestArgs) -> Result<()> {
@@ -1308,8 +1344,13 @@ async fn process_video(
     wiki_ingest_config: Option<&WikiIngestConfig>,
     missing_plugin_hint_emitted: Option<&mut bool>,
     interrupts: &Interrupts,
-) -> Result<()> {
+) -> Result<ProcessVideoOutcome> {
     interrupts.check()?;
+    // Snapshot stage state before the pipeline runs so the caller can
+    // distinguish "every stage was already complete" from "actual work
+    // happened" for exit-code accounting.
+    let before = stage_progress_signature(ledger, video_id)?;
+
     let metadata =
         load_or_fetch_metadata(&args.data_dir, ledger, video_id, args.force, interrupts).await?;
 
@@ -1352,6 +1393,10 @@ async fn process_video(
             config,
             WikiIngestBatchOptions {
                 video_id: Some(video_id),
+                // Auto-ingest only retries rows whose existing error was
+                // recorded by the wiki-ingest stage itself; the engine
+                // re-checks this per row. We pass `true` here so a row
+                // with a prior wiki-ingest failure is eligible.
                 retry_errors: true,
                 limit: None,
                 force: args.force,
@@ -1366,7 +1411,35 @@ async fn process_video(
     if let Err(err) = ledger.clear_stale_non_wiki_ingest_error(video_id) {
         warn!(%video_id, error = %err, "failed to clear stale ledger error after successful processing");
     }
-    Ok(())
+
+    let after = stage_progress_signature(ledger, video_id)?;
+    Ok(if after == before {
+        ProcessVideoOutcome::Skipped
+    } else {
+        ProcessVideoOutcome::Worked
+    })
+}
+
+/// Snapshot of every stage timestamp on a video row, used to detect
+/// whether a pipeline pass actually advanced any stage.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct StageProgressSignature {
+    downloaded_at: Option<String>,
+    transcribed_at: Option<String>,
+    wiki_emitted_at: Option<String>,
+    wiki_ingested_at: Option<String>,
+}
+
+fn stage_progress_signature(ledger: &Ledger, video_id: &str) -> Result<StageProgressSignature> {
+    Ok(ledger
+        .row(video_id)?
+        .map(|row| StageProgressSignature {
+            downloaded_at: row.downloaded_at,
+            transcribed_at: row.transcribed_at,
+            wiki_emitted_at: row.wiki_emitted_at,
+            wiki_ingested_at: row.wiki_ingested_at,
+        })
+        .unwrap_or_default())
 }
 
 async fn resolve_video_ids(
@@ -1955,7 +2028,11 @@ async fn run_wiki_ingest_batch(
             info!(video_id = %row.video_id, "wiki ingestion skipped because the refreshed row is no longer pending");
             continue;
         }
-        let force_for_row = force || (retry_errors && row.error.is_some());
+        // Match `should_attempt_wiki_ingest_row`: only treat an existing
+        // error as retry-eligible when it was recorded by the wiki-ingest
+        // stage itself.
+        let force_for_row =
+            force || (retry_errors && is_wiki_ingest_ledger_error(row.error.as_deref()));
         if should_skip_wiki_ingest_async(data_dir, &row, force_for_row).await {
             outcome.skipped += 1;
             info!(video_id = %row.video_id, "wiki ingestion skipped");
@@ -2103,10 +2180,16 @@ async fn should_attempt_wiki_ingest_row(
     if row.wiki_emitted_at.is_none() {
         return false;
     }
-    if !force && !retry_errors && row.error.is_some() {
+    // Only retry rows whose existing error was actually recorded by the
+    // wiki-ingest stage. Unrelated errors (stale download, transcript
+    // corruption, ...) must not trigger a paid LLM re-invocation just
+    // because the caller (e.g. `ingest --auto-wiki-ingest`) passes
+    // `retry_errors = true`.
+    let retry_eligible_error = retry_errors && is_wiki_ingest_ledger_error(row.error.as_deref());
+    if !force && !retry_eligible_error && row.error.is_some() {
         return false;
     }
-    if force || row.wiki_ingested_at.is_none() || (retry_errors && row.error.is_some()) {
+    if force || row.wiki_ingested_at.is_none() || retry_eligible_error {
         return true;
     }
 
@@ -2643,28 +2726,41 @@ async fn run_wiki_ingest_command(
             );
         }
         () = interrupts.wait() => {
-            interrupt_command_child(&mut child, process_group, &command.rendered).await;
-            let drain_deadline = Instant::now() + STREAM_READER_DRAIN_TIMEOUT;
-            let (stdout, stderr) = tokio::join!(
-                join_stream_reader_until(
-                    stdout_task,
-                    "stdout",
-                    &command.rendered,
-                    &stdout_progress,
-                    drain_deadline,
-                ),
-                join_stream_reader_until(
-                    stderr_task,
-                    "stderr",
-                    &command.rendered,
-                    &stderr_progress,
-                    drain_deadline,
-                )
-            );
-            if stdout.is_err() || stderr.is_err() {
-                kill_command_process_group(process_group, "interrupt stream drain failure", &command.rendered);
+            // tokio::select! makes no ordering guarantees, so an interrupt
+            // arriving at the same instant the child exits 0 can win the
+            // race. Before tearing the child down, see if it has actually
+            // finished; if so, treat this as a normal completion so a
+            // successful ingest isn't recorded as an interrupted failure.
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    terminate_command_process_group(process_group, "interrupt-after-exit", &command.rendered).await;
+                    status
+                }
+                _ => {
+                    interrupt_command_child(&mut child, process_group, &command.rendered).await;
+                    let drain_deadline = Instant::now() + STREAM_READER_DRAIN_TIMEOUT;
+                    let (stdout, stderr) = tokio::join!(
+                        join_stream_reader_until(
+                            stdout_task,
+                            "stdout",
+                            &command.rendered,
+                            &stdout_progress,
+                            drain_deadline,
+                        ),
+                        join_stream_reader_until(
+                            stderr_task,
+                            "stderr",
+                            &command.rendered,
+                            &stderr_progress,
+                            drain_deadline,
+                        )
+                    );
+                    if stdout.is_err() || stderr.is_err() {
+                        kill_command_process_group(process_group, "interrupt stream drain failure", &command.rendered);
+                    }
+                    return Err(InterruptedError.into());
+                }
             }
-            return Err(InterruptedError.into());
         }
     };
     let drain_deadline = Instant::now() + STREAM_READER_DRAIN_TIMEOUT;
@@ -7267,9 +7363,18 @@ exit 7
             ["ghi789"]
         );
 
+        // retry_errors=true must only resurface rows whose existing
+        // error came from the wiki-ingest stage itself — an unrelated
+        // "download failed" error must NOT trigger a paid LLM call.
         let rows = wiki_ingest_candidate_rows(dir.path(), &ledger, None, true, false, None).await?;
-        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.video_id.as_str())
+                .collect::<Vec<_>>(),
+            ["def456", "ghi789"]
+        );
 
+        // force=true bypasses error filtering entirely.
         let rows = wiki_ingest_candidate_rows(dir.path(), &ledger, None, false, true, None).await?;
         assert_eq!(rows.len(), 3);
 
