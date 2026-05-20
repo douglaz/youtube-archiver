@@ -2440,7 +2440,18 @@ async fn command_exists(program: &str, cwd: &Path) -> bool {
         return false;
     };
     for dir in env::split_paths(&paths) {
-        if executable_path_exists(&dir.join(program)).await {
+        // Relative PATH entries (e.g. `.`, `bin`) are resolved by the
+        // OS against the process cwd at spawn time, but spawn uses
+        // `.current_dir(cwd)` so the executed lookup is actually
+        // relative to the configured wiki-ingest cwd. Mirror that
+        // here so preflight doesn't false-negative on environments
+        // with relative PATH entries.
+        let resolved_dir = if dir.is_absolute() {
+            dir
+        } else {
+            cwd.join(dir)
+        };
+        if executable_path_exists(&resolved_dir.join(program)).await {
             return true;
         }
     }
