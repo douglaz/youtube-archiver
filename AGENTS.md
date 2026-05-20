@@ -113,7 +113,7 @@ midway, the next run finishes from there.
 
 Happy path:
 
-```
+```bash
 claude plugin install wiki@llm-wiki
 youtube-archiver ingest --auto-wiki-ingest <URL>
 ```
