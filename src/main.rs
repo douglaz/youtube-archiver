@@ -2433,12 +2433,7 @@ async fn preflight_wiki_ingest_command(
 async fn command_exists(program: &str, cwd: &Path) -> bool {
     let program_path = Path::new(program);
     if program_path.is_absolute() || program_has_path_separator(program) {
-        let path = if program_path.is_absolute() {
-            program_path.to_path_buf()
-        } else {
-            cwd.join(program_path)
-        };
-        return executable_path_exists(&path).await;
+        return executable_path_exists(&resolve_wiki_ingest_program(program, cwd)).await;
     }
 
     let Some(paths) = env::var_os("PATH") else {
@@ -2450,6 +2445,28 @@ async fn command_exists(program: &str, cwd: &Path) -> bool {
         }
     }
     false
+}
+
+/// Resolve a `--wiki-ingest-cmd` program to the path we will hand to
+/// `Command::new`. Keeps the resolution rule identical for preflight
+/// (`command_exists`) and execution (`run_wiki_ingest_command`):
+///
+/// - Absolute path → use as-is.
+/// - Relative path with a separator (e.g. `./ingest.sh`) → resolve
+///   against `cwd` so spawn doesn't depend on Rust/OS quirks around
+///   the `Command::new` + `current_dir` combination (Windows resolves
+///   the executable before the cwd takes effect).
+/// - Bare program (e.g. `claude`) → leave alone; the OS handles `PATH`
+///   resolution.
+fn resolve_wiki_ingest_program(program: &str, cwd: &Path) -> PathBuf {
+    let program_path = Path::new(program);
+    if program_path.is_absolute() {
+        program_path.to_path_buf()
+    } else if program_has_path_separator(program) {
+        cwd.join(program_path)
+    } else {
+        program_path.to_path_buf()
+    }
 }
 
 fn program_has_path_separator(program: &str) -> bool {
@@ -2566,7 +2583,15 @@ async fn run_wiki_ingest_command(
         .map(Instant::from_std)
         .ok_or_else(|| anyhow!("wiki-ingest timeout is too large: {}s", timeout.as_secs()))?;
 
-    let mut child_command = Command::new(&command.program);
+    // Resolve cwd-relative executables (e.g. `./ingest.sh`) to an
+    // absolute path BEFORE handing off to Command::new. `Command::new`
+    // combined with `.current_dir(cwd)` has platform-specific behavior
+    // — on Windows the program is resolved before the cwd is applied,
+    // so preflight (which checks `cwd.join(program)`) can pass while
+    // spawn fails. Aligning the resolution rule between preflight and
+    // spawn avoids that drift.
+    let resolved_program = resolve_wiki_ingest_program(&command.program, cwd);
+    let mut child_command = Command::new(&resolved_program);
     child_command
         .args(&command.args)
         .current_dir(cwd)
