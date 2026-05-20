@@ -1413,10 +1413,15 @@ async fn process_video(
     }
 
     let after = stage_progress_signature(ledger, video_id)?;
-    Ok(if after == before {
-        ProcessVideoOutcome::Skipped
-    } else {
+    // The stage signature uses second-precision timestamps. A `--force`
+    // rerun that reprocesses within the same second can leave the
+    // signature unchanged even though work happened, so trust the
+    // caller's `--force` intent: if the user explicitly asked us to
+    // rerun, the run counts as work for exit-code accounting.
+    Ok(if args.force || after != before {
         ProcessVideoOutcome::Worked
+    } else {
+        ProcessVideoOutcome::Skipped
     })
 }
 
@@ -3686,7 +3691,7 @@ async fn run_checked(program: &str, args: &[String], interrupts: &Interrupts) ->
         () = interrupts.wait() => {
             interrupt_command_child(&mut child, process_group, &command).await;
             let drain_deadline = Instant::now() + STREAM_READER_DRAIN_TIMEOUT;
-            let _ = tokio::join!(
+            let (stdout, stderr) = tokio::join!(
                 join_stream_reader_until(
                     stdout_task,
                     "stdout",
@@ -3702,6 +3707,14 @@ async fn run_checked(program: &str, args: &[String], interrupts: &Interrupts) ->
                     drain_deadline,
                 )
             );
+            // Mirror `run_wiki_ingest_command`: if a descendant kept
+            // pipes open past the drain deadline (ignored SIGINT or
+            // inherited the pipe to a child), escalate to SIGKILL on
+            // the whole process group so we don't leak background
+            // helpers.
+            if stdout.is_err() || stderr.is_err() {
+                kill_command_process_group(process_group, "interrupt stream drain failure", &command);
+            }
             return Err(InterruptedError.into());
         }
     };
@@ -3849,7 +3862,7 @@ async fn run_checked_stream_output(
         () = interrupts.wait() => {
             interrupt_command_child(&mut child, process_group, &command).await;
             let drain_deadline = Instant::now() + STREAM_READER_DRAIN_TIMEOUT;
-            let _ = tokio::join!(
+            let (stdout, stderr) = tokio::join!(
                 join_stream_reader_until(
                     stdout_task,
                     "stdout",
@@ -3865,6 +3878,14 @@ async fn run_checked_stream_output(
                     drain_deadline,
                 )
             );
+            // Mirror `run_wiki_ingest_command`: if a descendant kept
+            // pipes open past the drain deadline (ignored SIGINT or
+            // inherited the pipe to a child), escalate to SIGKILL on
+            // the whole process group so we don't leak background
+            // helpers.
+            if stdout.is_err() || stderr.is_err() {
+                kill_command_process_group(process_group, "interrupt stream drain failure", &command);
+            }
             return Err(InterruptedError.into());
         }
     };
