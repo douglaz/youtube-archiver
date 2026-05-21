@@ -53,21 +53,6 @@ const NON_LINUX_STALE_TEMP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static SLUG_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[^\p{Alphabetic}\p{Number}]+").expect("slug regex compiles"));
-static MISSING_WIKI_PLUGIN_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?ix)
-        ^\s*(?:error:\s*)?
-        (?:
-            (?:unknown\s+(?:slash\s+)?command|no\s+such\s+command|command\s+not\s+found)\b[^\r\n]{0,120}/wiki:ingest\b
-          | (?:slash\s+)?command\b[^\r\n]{0,120}/wiki:ingest\b[^\r\n]{0,80}(?:not\s+recognized|not\s+found|not\s+available|unavailable|unknown)
-          | /wiki:ingest\b[^\r\n]{0,80}(?:not\s+recognized|not\s+found|not\s+available|unavailable|unknown|requires\s+(?:the\s+)?(?:wiki|llm-wiki)\s+plugin)
-          | plugin\b[^\r\n]{0,60}\b(?:wiki|llm-wiki)\b[^\r\n]{0,60}\b(?:not\s+found|not\s+installed|not\s+enabled|disabled|missing)\b
-          | \b(?:wiki|llm-wiki)\b[^\r\n]{0,60}\bplugin\b[^\r\n]{0,60}\b(?:not\s+found|not\s+installed|not\s+enabled|disabled|missing)\b
-        )
-        ",
-    )
-    .expect("missing wiki plugin regex compiles")
-});
 
 #[derive(Parser, Debug)]
 #[command(name = "youtube-archiver")]
@@ -2007,7 +1992,6 @@ async fn run_wiki_ingest_batch(
     .await?;
 
     let mut failed_video_ids = Vec::new();
-    let mut attempted_invocations = 0usize;
     let mut local_missing_plugin_hint_emitted = false;
     let missing_plugin_hint_emitted =
         missing_plugin_hint_emitted.unwrap_or(&mut local_missing_plugin_hint_emitted);
@@ -2047,23 +2031,19 @@ async fn run_wiki_ingest_batch(
         let result = run_wiki_ingest_row(data_dir, ledger, config, &row, interrupts).await;
         match result {
             Ok(RunWikiIngestRowOutcome::Succeeded) => {
-                attempted_invocations += 1;
                 outcome.succeeded += 1;
                 info!(video_id = %row.video_id, "wiki ingestion completed");
             }
             Ok(RunWikiIngestRowOutcome::CommandFailed { status, stderr }) => {
-                attempted_invocations += 1;
                 outcome.failed += 1;
                 failed_video_ids.push(row.video_id.clone());
-                let stderr_for_hint = String::from_utf8_lossy(&stderr);
                 let stderr_tail =
                     stderr_tail_one_line_limited(&stderr, WIKI_INGEST_STDERR_LEDGER_LIMIT);
-                if should_emit_missing_wiki_plugin_hint(
-                    config.uses_default_template,
-                    attempted_invocations,
-                    *missing_plugin_hint_emitted,
-                    stderr_for_hint.as_ref(),
-                ) {
+                // On the very first per-batch failure with the default
+                // template, print the install hint once. Detecting the
+                // exact failure prose is brittle; the user can disregard
+                // the hint when it's irrelevant.
+                if config.uses_default_template && !*missing_plugin_hint_emitted {
                     eprintln!("{}", wiki_ingest_install_hint());
                     *missing_plugin_hint_emitted = true;
                 }
@@ -3077,11 +3057,6 @@ fn exit_status_code(status: &ExitStatus) -> String {
         .map_or_else(|| status.to_string(), |code| code.to_string())
 }
 
-#[cfg(test)]
-fn stderr_tail_one_line(stderr: &[u8]) -> String {
-    stderr_tail_one_line_limited(stderr, stderr.len())
-}
-
 fn stderr_tail_one_line_limited(stderr: &[u8], limit: usize) -> String {
     let stderr = if limit == 0 || stderr.len() <= limit {
         stderr
@@ -3122,24 +3097,6 @@ fn one_line_error(err: &anyhow::Error) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-fn is_missing_wiki_plugin_error(stderr_tail: &str) -> bool {
-    stderr_tail
-        .lines()
-        .any(|line| MISSING_WIKI_PLUGIN_RE.is_match(line))
-}
-
-fn should_emit_missing_wiki_plugin_hint(
-    uses_default_template: bool,
-    attempted_invocations: usize,
-    already_emitted: bool,
-    stderr_tail: &str,
-) -> bool {
-    uses_default_template
-        && attempted_invocations == 1
-        && !already_emitted
-        && is_missing_wiki_plugin_error(stderr_tail)
 }
 
 fn is_wiki_ingest_ledger_error(error: Option<&str>) -> bool {
@@ -5141,53 +5098,6 @@ mod tests {
     }
 
     #[test]
-    fn missing_wiki_plugin_classifier_matches_expected_phrases() {
-        assert!(is_missing_wiki_plugin_error(
-            "unknown command: /wiki:ingest"
-        ));
-        assert!(is_missing_wiki_plugin_error("No such command /wiki:ingest"));
-        assert!(is_missing_wiki_plugin_error(
-            "command not found: /wiki:ingest"
-        ));
-        assert!(is_missing_wiki_plugin_error(
-            "unknown slash command: /wiki:ingest"
-        ));
-        assert!(is_missing_wiki_plugin_error(
-            "Command '/wiki:ingest' is not recognized"
-        ));
-        assert!(is_missing_wiki_plugin_error(
-            "slash command /wiki:ingest is not available"
-        ));
-        assert!(is_missing_wiki_plugin_error(
-            "/wiki:ingest requires the wiki plugin"
-        ));
-        assert!(is_missing_wiki_plugin_error("plugin wiki not found"));
-        assert!(is_missing_wiki_plugin_error(
-            "llm-wiki plugin missing from this workspace"
-        ));
-        assert!(is_missing_wiki_plugin_error(
-            "Plugin wiki was not installed for this session"
-        ));
-        assert!(is_missing_wiki_plugin_error(
-            "startup complete\nerror: unknown command: /wiki:ingest\n"
-        ));
-        assert!(!is_missing_wiki_plugin_error("unknown command: status"));
-        assert!(!is_missing_wiki_plugin_error("plugin calendar not found"));
-        assert!(!is_missing_wiki_plugin_error(
-            "failed to run /wiki:ingest after a transient network timeout"
-        ));
-        assert!(!is_missing_wiki_plugin_error(
-            "transcript text: plugin wiki not found in the quoted source"
-        ));
-        assert!(!is_missing_wiki_plugin_error(
-            "note: unknown command: /wiki:ingest appears in transcript text"
-        ));
-        assert!(!is_missing_wiki_plugin_error(
-            "network timeout while reading file"
-        ));
-    }
-
-    #[test]
     fn stderr_tail_preserves_line_structure_on_one_line() {
         let stderr = b"  first line\n  {\"error\":\"bad value\"}\r\nthird\tline  ";
 
@@ -5195,45 +5105,6 @@ mod tests {
             stderr_tail_one_line_limited(stderr, stderr.len()),
             r#"first line\n  {"error":"bad value"}\nthird\tline"#
         );
-    }
-
-    #[test]
-    fn missing_wiki_plugin_classifier_uses_more_than_ledger_stderr_tail() {
-        let mut stderr = b"unknown command: /wiki:ingest ".to_vec();
-        stderr.extend(vec![b'x'; WIKI_INGEST_STDERR_LEDGER_LIMIT + 1]);
-
-        assert!(!is_missing_wiki_plugin_error(
-            &stderr_tail_one_line_limited(&stderr, WIKI_INGEST_STDERR_LEDGER_LIMIT)
-        ));
-        assert!(is_missing_wiki_plugin_error(&stderr_tail_one_line(&stderr)));
-    }
-
-    #[test]
-    fn missing_wiki_plugin_hint_only_applies_to_default_template() {
-        assert!(should_emit_missing_wiki_plugin_hint(
-            true,
-            1,
-            false,
-            "unknown command: /wiki:ingest",
-        ));
-        assert!(!should_emit_missing_wiki_plugin_hint(
-            false,
-            1,
-            false,
-            "unknown command: /wiki:ingest",
-        ));
-        assert!(!should_emit_missing_wiki_plugin_hint(
-            true,
-            2,
-            false,
-            "unknown command: /wiki:ingest",
-        ));
-        assert!(!should_emit_missing_wiki_plugin_hint(
-            true,
-            1,
-            true,
-            "unknown command: /wiki:ingest",
-        ));
     }
 
     #[test]
