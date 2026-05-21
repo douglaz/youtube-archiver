@@ -2424,94 +2424,14 @@ fn resolve_wiki_ingest_program(program: &str, cwd: &Path) -> PathBuf {
 }
 
 fn program_has_path_separator(program: &str) -> bool {
-    #[cfg(windows)]
-    {
-        program.contains('/') || program.contains('\\')
-    }
-    #[cfg(not(windows))]
-    {
-        program.contains(std::path::MAIN_SEPARATOR)
-    }
+    program.contains(std::path::MAIN_SEPARATOR)
 }
 
-#[cfg(not(windows))]
 async fn executable_path_exists(path: &Path) -> bool {
-    is_executable_file(path).await
-}
-
-#[cfg(windows)]
-async fn executable_path_exists(path: &Path) -> bool {
-    for candidate in windows_executable_candidates(path) {
-        if is_executable_file(&candidate).await {
-            return true;
-        }
-    }
-    false
-}
-
-#[cfg(unix)]
-async fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
-
     fs::metadata(path)
         .await
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-}
-
-#[cfg(all(not(unix), not(windows)))]
-async fn is_executable_file(path: &Path) -> bool {
-    fs::metadata(path)
-        .await
-        .is_ok_and(|metadata| metadata.is_file())
-}
-
-#[cfg(windows)]
-async fn is_executable_file(path: &Path) -> bool {
-    if !fs::metadata(path)
-        .await
-        .is_ok_and(|metadata| metadata.is_file())
-    {
-        return false;
-    }
-    windows_executable_extensions().iter().any(|extension| {
-        path.extension()
-            .and_then(|value| value.to_str())
-            .is_some_and(|value| format!(".{value}").eq_ignore_ascii_case(extension))
-    })
-}
-
-#[cfg(windows)]
-fn windows_executable_candidates(path: &Path) -> Vec<PathBuf> {
-    if path.extension().is_some() {
-        return vec![path.to_path_buf()];
-    }
-    windows_executable_extensions()
-        .into_iter()
-        .map(|extension| {
-            let mut candidate = path.as_os_str().to_owned();
-            candidate.push(extension);
-            PathBuf::from(candidate)
-        })
-        .collect()
-}
-
-#[cfg(windows)]
-fn windows_executable_extensions() -> Vec<String> {
-    env::var_os("PATHEXT")
-        .map(|value| value.to_string_lossy().into_owned())
-        .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_owned())
-        .split(';')
-        .filter_map(|value| {
-            let value = value.trim();
-            if value.is_empty() {
-                None
-            } else if value.starts_with('.') {
-                Some(value.to_owned())
-            } else {
-                Some(format!(".{value}"))
-            }
-        })
-        .collect()
 }
 
 fn wiki_ingest_install_hint() -> &'static str {
