@@ -1171,7 +1171,6 @@ async fn ingest(args: IngestArgs, interrupts: &Interrupts) -> Result<()> {
     };
     if let Some(config) = wiki_ingest_config.as_ref() {
         warn_if_using_default_wiki_ingest_command(config);
-        preflight_wiki_ingest_config(&args.data_dir, config).await?;
     }
 
     let ledger = Ledger::open(&args.data_dir)?;
@@ -1754,7 +1753,6 @@ async fn list(args: DataDirArgs) -> Result<()> {
 async fn wiki_ingest(args: WikiIngestCommandArgs, interrupts: &Interrupts) -> Result<()> {
     let config = wiki_ingest_config(&args.data_dir, &args.wiki_ingest)?;
     warn_if_using_default_wiki_ingest_command(&config);
-    preflight_wiki_ingest_config(&args.data_dir, &config).await?;
     let ledger = Ledger::open(&args.data_dir)?;
     run_wiki_ingest_batch(
         &args.data_dir,
@@ -1845,7 +1843,7 @@ async fn run_wiki_ingest_batch(
     }
 
     let preflight_command =
-        render_wiki_ingest_preflight_command(data_dir, &config.template, Some(&rows[0]))?;
+        render_wiki_ingest_preflight_command(data_dir, &config.template, &rows[0])?;
     preflight_wiki_ingest_command(
         &preflight_command.program,
         &config.cwd,
@@ -2165,17 +2163,22 @@ fn wiki_ingest_template_values(
 fn render_wiki_ingest_preflight_command(
     data_dir: &Path,
     template: &str,
-    row: Option<&VideoRow>,
+    row: &VideoRow,
 ) -> Result<RenderedWikiIngestCommand> {
-    let values = match row {
-        Some(row) => wiki_ingest_preflight_template_values(data_dir, row)?,
-        None => {
-            let path = absolutize_path(&data_dir.join("wiki").join(".preflight.md"))?;
-            WikiIngestTemplateValues {
-                path: path_to_string(&path),
-                video_id: "preflight".to_owned(),
-            }
-        }
+    // Preflight renders the template against the first real candidate's
+    // metadata so `command -v` checks the same program we're about to
+    // spawn. The default Claude template doesn't reference row-dependent
+    // tokens in argv[0]; a hand-rolled `--wiki-ingest-cmd` that does will
+    // fail later rows noisily, which is acceptable for a power-user knob.
+    let wiki_path = row
+        .wiki_path
+        .as_deref()
+        .map(|path| ledger_path_to_fs_path(data_dir, path))
+        .unwrap_or_else(|| data_dir.join("wiki").join(".preflight.md"));
+    let absolute_wiki_path = absolutize_path(&wiki_path)?;
+    let values = WikiIngestTemplateValues {
+        path: path_to_string(&absolute_wiki_path),
+        video_id: row.video_id.clone(),
     };
     let rendered = render_wiki_ingest_template(template, &values);
     let argv = shell_words::split(&rendered).context("parse rendered wiki ingestion command")?;
@@ -2189,39 +2192,12 @@ fn render_wiki_ingest_preflight_command(
     })
 }
 
-fn wiki_ingest_preflight_template_values(
-    data_dir: &Path,
-    row: &VideoRow,
-) -> Result<WikiIngestTemplateValues> {
-    let wiki_path = row
-        .wiki_path
-        .as_deref()
-        .map(|path| ledger_path_to_fs_path(data_dir, path))
-        .unwrap_or_else(|| data_dir.join("wiki").join(".preflight.md"));
-    let absolute_wiki_path = absolutize_path(&wiki_path)?;
-    Ok(WikiIngestTemplateValues {
-        path: path_to_string(&absolute_wiki_path),
-        video_id: row.video_id.clone(),
-    })
-}
-
 fn wiki_path_from_row(data_dir: &Path, row: &VideoRow) -> Result<PathBuf> {
     let path = row
         .wiki_path
         .as_deref()
         .ok_or_else(|| anyhow!("ledger row for {} has no wiki_path", row.video_id))?;
     Ok(ledger_path_to_fs_path(data_dir, path))
-}
-
-async fn preflight_wiki_ingest_config(data_dir: &Path, config: &WikiIngestConfig) -> Result<()> {
-    let command = render_wiki_ingest_preflight_command(data_dir, &config.template, None)?;
-    preflight_wiki_ingest_command(
-        &command.program,
-        &config.cwd,
-        config.create_cwd_for_preflight,
-        config.uses_default_template,
-    )
-    .await
 }
 
 async fn preflight_wiki_ingest_command(
@@ -5589,42 +5565,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ingest_auto_wiki_ingest_preflights_before_resolving_videos() -> Result<()> {
-        let dir = tempdir()?;
-        let missing_command = format!("missing-yta-command-{} {{path}}", std::process::id());
-        let args = IngestArgs {
-            url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_owned(),
-            data_dir: dir.path().to_path_buf(),
-            whisper_model: "large".to_owned(),
-            whisper_bin: DEFAULT_WHISPER_BIN.to_owned(),
-            whisper_args: Vec::new(),
-            limit: None,
-            audio_format: "m4a".to_owned(),
-            force: false,
-            auto_wiki_ingest: true,
-            wiki_ingest: WikiIngestArgs {
-                wiki_ingest_cmd: Some(missing_command),
-                wiki_ingest_cwd: None,
-                wiki_ingest_timeout_secs: None,
-            },
-        };
-        let interrupts = Interrupts::inactive();
-
-        let err = ingest(args, &interrupts)
-            .await
-            .expect_err("missing wiki ingestion command should fail before yt-dlp");
-        let exit = err
-            .downcast_ref::<ExitCodeError>()
-            .expect("missing command should use explicit exit code");
-
-        assert_eq!(exit.code, 3);
-        assert!(exit.message.contains("wiki ingestion command not found"));
-        assert!(!dir.path().join("state.sqlite").exists());
-        assert!(!dir.path().join("wiki").exists());
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn preflight_wiki_ingest_command_creates_default_cwd_after_command_is_found() -> Result<()>
     {
         let dir = tempdir()?;
@@ -5638,7 +5578,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wiki_ingest_preflights_before_opening_ledger() -> Result<()> {
+    async fn wiki_ingest_skips_preflight_when_no_work_is_pending() -> Result<()> {
+        // Empty data dir => no candidates => no preflight => no claude needed.
+        // This is the UX fix: standalone `wiki-ingest` on a fresh / fully-drained
+        // archive must succeed even without the default backend installed.
         let dir = tempdir()?;
         let missing_command = format!("missing-yta-command-{} {{path}}", std::process::id());
         let args = WikiIngestCommandArgs {
@@ -5655,16 +5598,9 @@ mod tests {
         };
         let interrupts = Interrupts::inactive();
 
-        let err = wiki_ingest(args, &interrupts)
+        wiki_ingest(args, &interrupts)
             .await
-            .expect_err("missing wiki ingestion command should fail before ledger open");
-        let exit = err
-            .downcast_ref::<ExitCodeError>()
-            .expect("missing command should use explicit exit code");
-
-        assert_eq!(exit.code, 3);
-        assert!(exit.message.contains("wiki ingestion command not found"));
-        assert!(!dir.path().join("state.sqlite").exists());
+            .expect("empty wiki-ingest should succeed without preflighting the command");
         Ok(())
     }
 
