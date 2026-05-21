@@ -1186,8 +1186,6 @@ async fn ingest(args: IngestArgs, interrupts: &Interrupts) -> Result<()> {
     ensure_resolved_videos(&ledger, &video_ids)?;
 
     let mut succeeded = 0usize;
-    let mut skipped = 0usize;
-    let mut failed = 0usize;
     let mut failed_video_ids = Vec::new();
     let mut missing_plugin_hint_emitted = false;
 
@@ -1203,19 +1201,14 @@ async fn ingest(args: IngestArgs, interrupts: &Interrupts) -> Result<()> {
         )
         .await
         {
-            Ok(ProcessVideoOutcome::Worked) => {
+            Ok(()) => {
                 succeeded += 1;
                 info!(%video_id, "video processed");
-            }
-            Ok(ProcessVideoOutcome::Skipped) => {
-                skipped += 1;
-                info!(%video_id, "video already complete, nothing to do");
             }
             Err(err) => {
                 if is_interrupted_error(&err) {
                     return Err(err);
                 }
-                failed += 1;
                 failed_video_ids.push(video_id.clone());
                 let message = format!("{err:#}");
                 error!(%video_id, error = %message, "video failed");
@@ -1229,25 +1222,18 @@ async fn ingest(args: IngestArgs, interrupts: &Interrupts) -> Result<()> {
     }
 
     interrupts.check()?;
-    // Match `wiki-ingest` semantics: only bail when every video that
-    // actually needed work failed. A run consisting entirely of skips
-    // (with no failures) is a successful no-op.
-    if succeeded == 0 && failed > 0 {
+    // Per AGENTS.md: nonzero exit only when every attempted video failed.
+    // Already-done re-runs (everything skipped at the stage level) count
+    // as Ok and so as successful attempts.
+    if succeeded == 0 && !failed_video_ids.is_empty() {
         bail!(
-            "every video failed ({failed} failure(s), {skipped} already complete): {}",
+            "every video failed ({} failure(s)): {}",
+            failed_video_ids.len(),
             failed_video_ids.join(", ")
         );
     }
 
     Ok(())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProcessVideoOutcome {
-    /// At least one pipeline stage advanced the ledger.
-    Worked,
-    /// Every stage was already complete; this run was a no-op for this video.
-    Skipped,
 }
 
 fn reject_ignored_wiki_ingest_options(args: &IngestArgs) -> Result<()> {
@@ -1287,12 +1273,8 @@ async fn process_video(
     wiki_ingest_config: Option<&WikiIngestConfig>,
     missing_plugin_hint_emitted: Option<&mut bool>,
     interrupts: &Interrupts,
-) -> Result<ProcessVideoOutcome> {
+) -> Result<()> {
     interrupts.check()?;
-    // Snapshot stage state before the pipeline runs so the caller can
-    // distinguish "every stage was already complete" from "actual work
-    // happened" for exit-code accounting.
-    let before = stage_progress_signature(ledger, video_id)?;
 
     let metadata =
         load_or_fetch_metadata(&args.data_dir, ledger, video_id, args.force, interrupts).await?;
@@ -1354,40 +1336,7 @@ async fn process_video(
     if let Err(err) = ledger.clear_stale_non_wiki_ingest_error(video_id) {
         warn!(%video_id, error = %err, "failed to clear stale ledger error after successful processing");
     }
-
-    let after = stage_progress_signature(ledger, video_id)?;
-    // The stage signature uses second-precision timestamps. A `--force`
-    // rerun that reprocesses within the same second can leave the
-    // signature unchanged even though work happened, so trust the
-    // caller's `--force` intent: if the user explicitly asked us to
-    // rerun, the run counts as work for exit-code accounting.
-    Ok(if args.force || after != before {
-        ProcessVideoOutcome::Worked
-    } else {
-        ProcessVideoOutcome::Skipped
-    })
-}
-
-/// Snapshot of every stage timestamp on a video row, used to detect
-/// whether a pipeline pass actually advanced any stage.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct StageProgressSignature {
-    downloaded_at: Option<String>,
-    transcribed_at: Option<String>,
-    wiki_emitted_at: Option<String>,
-    wiki_ingested_at: Option<String>,
-}
-
-fn stage_progress_signature(ledger: &Ledger, video_id: &str) -> Result<StageProgressSignature> {
-    Ok(ledger
-        .row(video_id)?
-        .map(|row| StageProgressSignature {
-            downloaded_at: row.downloaded_at,
-            transcribed_at: row.transcribed_at,
-            wiki_emitted_at: row.wiki_emitted_at,
-            wiki_ingested_at: row.wiki_ingested_at,
-        })
-        .unwrap_or_default())
+    Ok(())
 }
 
 async fn resolve_video_ids(
