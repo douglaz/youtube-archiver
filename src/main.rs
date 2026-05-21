@@ -166,7 +166,7 @@ struct WikiIngestArgs {
         value_name = "TEMPLATE",
         value_parser = parse_wiki_ingest_template,
         help = "Wiki ingestion command template containing {path}; used by wiki-ingest or ingest --auto-wiki-ingest",
-        long_help = "Wiki ingestion command template containing {path}; overrides YTARCH_WIKI_INGEST_CMD. Values for {path}, {video_id}, {title}, and {channel_slug} are shell-escaped before parsing. The built-in default runs Claude Code with --permission-mode acceptEdits and allows Bash,Read,Write,Edit,Glob,Grep,Task. On the ingest command this option requires --auto-wiki-ingest."
+        long_help = "Wiki ingestion command template containing {path}; overrides YTARCH_WIKI_INGEST_CMD. Values for {path} and {video_id} are shell-escaped before parsing into an argv (no shell, no pipes, no env-var expansion). The built-in default runs Claude Code with --permission-mode acceptEdits and allows Bash,Read,Write,Edit,Glob,Grep,Task. On the ingest command this option requires --auto-wiki-ingest."
     )]
     wiki_ingest_cmd: Option<String>,
 
@@ -232,37 +232,15 @@ fn validate_wiki_ingest_template(value: &str) -> std::result::Result<(), String>
         return Err("template must contain {path}".to_owned());
     }
 
-    let values_a = WikiIngestTemplateValues {
-        path: "/tmp/youtube archiver/wiki/channel-a/video \"quoted\".md".to_owned(),
+    let values = WikiIngestTemplateValues {
+        path: "/tmp/youtube archiver/wiki/sample/video \"quoted\".md".to_owned(),
         video_id: "abc123".to_owned(),
-        title: "A \"quoted\" title".to_owned(),
-        channel_slug: "channel-a".to_owned(),
     };
-    let rendered_a = render_wiki_ingest_template(value, &values_a);
-    let argv_a = shell_words::split(&rendered_a)
+    let rendered = render_wiki_ingest_template(value, &values);
+    let argv = shell_words::split(&rendered)
         .map_err(|err| format!("template must render to a shell-parseable command: {err}"))?;
-    if argv_a.is_empty() {
+    if argv.is_empty() {
         return Err("template must render to a non-empty command".to_owned());
-    }
-
-    // The preflight `command -v` check renders the template with the
-    // first candidate row's metadata. If argv[0] varies per row (e.g.
-    // a template like `~/scripts/{channel_slug}-ingest.sh {path}`),
-    // preflight succeeds for one row and silently faults mid-batch on
-    // a row with a different channel/title. Reject such templates.
-    let values_b = WikiIngestTemplateValues {
-        path: "/var/tmp/different/wiki/channel-b/other.md".to_owned(),
-        video_id: "zyx987".to_owned(),
-        title: "Different title".to_owned(),
-        channel_slug: "channel-b".to_owned(),
-    };
-    let rendered_b = render_wiki_ingest_template(value, &values_b);
-    let argv_b = shell_words::split(&rendered_b)
-        .map_err(|err| format!("template must render to a shell-parseable command: {err}"))?;
-    if argv_b.first() != argv_a.first() {
-        return Err(
-            "template's program (first token) must not reference {path}, {video_id}, {title}, or {channel_slug}; preflight cannot check a command that varies per video".to_owned(),
-        );
     }
 
     Ok(())
@@ -346,8 +324,6 @@ struct RenderedWikiIngestCommand {
 struct WikiIngestTemplateValues {
     path: String,
     video_id: String,
-    title: String,
-    channel_slug: String,
 }
 
 #[derive(Debug)]
@@ -2282,10 +2258,6 @@ fn wiki_ingest_template_token<'a>(
         Some(("{path}", &values.path))
     } else if value.starts_with("{video_id}") {
         Some(("{video_id}", &values.video_id))
-    } else if value.starts_with("{title}") {
-        Some(("{title}", &values.title))
-    } else if value.starts_with("{channel_slug}") {
-        Some(("{channel_slug}", &values.channel_slug))
     } else {
         None
     }
@@ -2300,8 +2272,6 @@ fn wiki_ingest_template_values(
     Ok(WikiIngestTemplateValues {
         path: path_to_string(&absolute_wiki_path),
         video_id: row.video_id.clone(),
-        title: row.title.clone().unwrap_or_default(),
-        channel_slug: channel_slug_from_wiki_path(&wiki_path),
     })
 }
 
@@ -2317,8 +2287,6 @@ fn render_wiki_ingest_preflight_command(
             WikiIngestTemplateValues {
                 path: path_to_string(&path),
                 video_id: "preflight".to_owned(),
-                title: String::new(),
-                channel_slug: String::new(),
             }
         }
     };
@@ -2347,8 +2315,6 @@ fn wiki_ingest_preflight_template_values(
     Ok(WikiIngestTemplateValues {
         path: path_to_string(&absolute_wiki_path),
         video_id: row.video_id.clone(),
-        title: row.title.clone().unwrap_or_default(),
-        channel_slug: channel_slug_from_wiki_path(&wiki_path),
     })
 }
 
@@ -2358,14 +2324,6 @@ fn wiki_path_from_row(data_dir: &Path, row: &VideoRow) -> Result<PathBuf> {
         .as_deref()
         .ok_or_else(|| anyhow!("ledger row for {} has no wiki_path", row.video_id))?;
     Ok(ledger_path_to_fs_path(data_dir, path))
-}
-
-fn channel_slug_from_wiki_path(path: &Path) -> String {
-    path.parent()
-        .and_then(Path::file_name)
-        .and_then(|value| value.to_str())
-        .unwrap_or("")
-        .to_owned()
 }
 
 async fn preflight_wiki_ingest_config(data_dir: &Path, config: &WikiIngestConfig) -> Result<()> {
@@ -5010,73 +4968,34 @@ mod tests {
         let values = WikiIngestTemplateValues {
             path: "/tmp/wiki dir/{video_id}/video's file.md".to_owned(),
             video_id: "abc123".to_owned(),
-            title: "A \"quoted\" {path} title".to_owned(),
-            channel_slug: "rust channel".to_owned(),
         };
-        let template = "cmd {path} {video_id} {title} {channel_slug}";
+        let template = "cmd {path} {video_id}";
 
         let rendered = render_wiki_ingest_template(template, &values);
 
         assert_eq!(
             rendered,
-            format!(
-                "cmd {} abc123 {} {}",
-                shell_words::quote(&values.path),
-                shell_words::quote(&values.title),
-                shell_words::quote(&values.channel_slug)
-            )
+            format!("cmd {} abc123", shell_words::quote(&values.path))
         );
         let argv = shell_words::split(&rendered)?;
         assert_eq!(argv[1], values.path);
         assert_eq!(argv[2], values.video_id);
-        assert_eq!(argv[3], values.title);
-        assert_eq!(argv[4], values.channel_slug);
         Ok(())
     }
 
     #[test]
-    fn render_wiki_ingest_template_quotes_tokens_inside_quotes() -> Result<()> {
+    fn render_wiki_ingest_template_quotes_path_inside_quotes() -> Result<()> {
         let values = WikiIngestTemplateValues {
             path: "/tmp/wiki dir/video \"quoted\" $file.md".to_owned(),
             video_id: "abc123".to_owned(),
-            title: "can't stop".to_owned(),
-            channel_slug: "rust channel".to_owned(),
         };
 
-        let rendered = render_wiki_ingest_template(
-            "cmd \"/wiki:ingest {path}\" 'title {title}' {channel_slug}",
-            &values,
-        );
+        let rendered =
+            render_wiki_ingest_template("cmd \"/wiki:ingest {path}\" '{video_id}'", &values);
         let argv = shell_words::split(&rendered)?;
 
-        assert!(rendered.contains(r#"'title can'\''t stop'"#));
         assert_eq!(argv[1], format!("/wiki:ingest {}", values.path));
-        assert_eq!(argv[2], format!("title {}", values.title));
-        assert_eq!(argv[3], values.channel_slug);
-        Ok(())
-    }
-
-    #[test]
-    fn render_wiki_ingest_template_supports_shell_scripts_with_positional_args() -> Result<()> {
-        let values = WikiIngestTemplateValues {
-            path: "/tmp/yta space/wiki/foo/abc123.md".to_owned(),
-            video_id: "abc123".to_owned(),
-            title: "quoted title'; touch nope".to_owned(),
-            channel_slug: "foo".to_owned(),
-        };
-
-        let rendered = render_wiki_ingest_template(
-            "sh -c 'test -f \"$1\" && printf %s \"$2\"' sh {path} {title}",
-            &values,
-        );
-        let argv = shell_words::split(&rendered)?;
-
-        assert_eq!(argv[0], "sh");
-        assert_eq!(argv[1], "-c");
-        assert_eq!(argv[2], "test -f \"$1\" && printf %s \"$2\"");
-        assert_eq!(argv[3], "sh");
-        assert_eq!(argv[4], values.path);
-        assert_eq!(argv[5], values.title);
+        assert_eq!(argv[2], values.video_id);
         Ok(())
     }
 
@@ -5085,8 +5004,6 @@ mod tests {
         let values = WikiIngestTemplateValues {
             path: "/tmp/wiki dir/abc123.md".to_owned(),
             video_id: "abc123".to_owned(),
-            title: "A Title".to_owned(),
-            channel_slug: "foo".to_owned(),
         };
 
         let rendered = render_wiki_ingest_template(r#"cmd \{path} '{video_id}'"#, &values);
@@ -5112,8 +5029,6 @@ mod tests {
         let values = WikiIngestTemplateValues {
             path: "/tmp/wiki dir/video \"quoted\" file.md".to_owned(),
             video_id: "abc123".to_owned(),
-            title: String::new(),
-            channel_slug: "wiki-dir".to_owned(),
         };
 
         let rendered = render_wiki_ingest_template(DEFAULT_WIKI_INGEST_CMD, &values);
