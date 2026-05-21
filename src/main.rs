@@ -1,7 +1,6 @@
 use std::{
     collections::HashSet,
     env, fmt, future,
-    io::Write,
     path::{Component, Path, PathBuf},
     process::{ExitStatus, Output, Stdio},
     sync::{
@@ -13,7 +12,6 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
-use fs4::{FileExt, TryLockError};
 use regex::Regex;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -474,21 +472,6 @@ impl<T> Drop for AbortOnDrop<T> {
     fn drop(&mut self) {
         if let Some(handle) = &self.handle {
             handle.abort();
-        }
-    }
-}
-
-#[derive(Debug)]
-struct DataDirLock {
-    path: PathBuf,
-    description: &'static str,
-    file: std::fs::File,
-}
-
-impl Drop for DataDirLock {
-    fn drop(&mut self) {
-        if let Err(err) = self.file.unlock() {
-            warn!(path = %self.path.display(), description = self.description, error = %err, "failed to unlock data-dir lock");
         }
     }
 }
@@ -1181,7 +1164,6 @@ async fn ingest(args: IngestArgs, interrupts: &Interrupts) -> Result<()> {
     reject_ignored_wiki_ingest_options(&args)?;
     std::fs::create_dir_all(&args.data_dir)
         .with_context(|| format!("create data dir {}", args.data_dir.display()))?;
-    let _ingest_lock = acquire_ingest_lock(&args.data_dir)?;
     let wiki_ingest_config = if args.auto_wiki_ingest {
         Some(wiki_ingest_config(&args.data_dir, &args.wiki_ingest)?)
     } else {
@@ -1878,49 +1860,6 @@ fn wiki_ingest_error_like_pattern() -> String {
     format!("{WIKI_INGEST_ERROR_PREFIX}%")
 }
 
-fn acquire_ingest_lock(data_dir: &Path) -> Result<DataDirLock> {
-    acquire_data_dir_lock_at(data_dir.join(".ingest.lock"), "ingest")
-}
-
-fn acquire_data_dir_lock_at(path: PathBuf, description: &'static str) -> Result<DataDirLock> {
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)
-        .with_context(|| format!("open {description} lock {}", path.display()))?;
-
-    match FileExt::try_lock(&file) {
-        Ok(()) => {}
-        Err(TryLockError::WouldBlock) => {
-            bail!(
-                "{description} is already running (lock file: {})",
-                path.display()
-            );
-        }
-        Err(TryLockError::Error(err)) => {
-            return Err(err).with_context(|| format!("lock {description} {}", path.display()));
-        }
-    };
-
-    if let Err(err) = file.set_len(0) {
-        warn!(path = %path.display(), description, error = %err, "failed to truncate data-dir lock metadata");
-    }
-    if let Err(err) = writeln!(file, "pid={}", std::process::id()) {
-        warn!(path = %path.display(), description, error = %err, "failed to write data-dir lock metadata");
-    }
-    Ok(DataDirLock {
-        path,
-        description,
-        file,
-    })
-}
-
-fn acquire_wiki_ingest_lock(data_dir: &Path) -> Result<DataDirLock> {
-    acquire_data_dir_lock_at(data_dir.join(".wiki-ingest.lock"), "wiki ingestion")
-}
-
 async fn run_wiki_ingest_batch(
     data_dir: &Path,
     ledger: &Ledger,
@@ -1956,7 +1895,6 @@ async fn run_wiki_ingest_batch(
         return Ok(outcome);
     }
 
-    let _lock = acquire_wiki_ingest_lock(data_dir)?;
     let preflight_command =
         render_wiki_ingest_preflight_command(data_dir, &config.template, Some(&rows[0]))?;
     preflight_wiki_ingest_command(
@@ -6992,29 +6930,6 @@ exit 7
                 .wiki_ingested_at
                 .is_some()
         );
-        Ok(())
-    }
-
-    #[test]
-    fn wiki_ingest_lock_rejects_concurrent_batch() -> Result<()> {
-        let dir = tempdir()?;
-        let _lock = acquire_wiki_ingest_lock(dir.path())?;
-
-        let err = acquire_wiki_ingest_lock(dir.path())
-            .expect_err("second wiki ingestion lock should fail");
-
-        assert!(format!("{err:#}").contains("already running"));
-        Ok(())
-    }
-
-    #[test]
-    fn ingest_lock_rejects_concurrent_run() -> Result<()> {
-        let dir = tempdir()?;
-        let _lock = acquire_ingest_lock(dir.path())?;
-
-        let err = acquire_ingest_lock(dir.path()).expect_err("second ingest lock should fail");
-
-        assert!(format!("{err:#}").contains("ingest is already running"));
         Ok(())
     }
 
