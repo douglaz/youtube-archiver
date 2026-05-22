@@ -1930,9 +1930,20 @@ async fn run_wiki_ingest_batch(
                 if is_interrupted_error(&err) {
                     return Err(err);
                 }
+                let one_line = one_line_error(&err);
+                // The concurrency guard in `mark_wiki_ingested` raises this
+                // when another process won the race and stamped the row
+                // first. The winner already recorded success - persisting
+                // the loser's "row changed" as an error would mask that
+                // and cause `--retry-errors` to re-invoke the LLM.
+                if one_line.contains("ledger row changed while wiki ingestion was running") {
+                    outcome.skipped += 1;
+                    info!(video_id = %row.video_id, "wiki ingestion skipped: row was claimed by a concurrent run");
+                    continue;
+                }
                 outcome.failed += 1;
                 failed_video_ids.push(row.video_id.clone());
-                let message = format!("{WIKI_INGEST_ERROR_PREFIX}failed: {}", one_line_error(&err));
+                let message = format!("{WIKI_INGEST_ERROR_PREFIX}failed: {one_line}");
                 error!(video_id = %row.video_id, error = %message, "wiki ingestion failed");
                 if let Err(err) = ledger.mark_error(&row.video_id, &message) {
                     warn!(video_id = %row.video_id, error = %err, original_error = %message, "failed to record wiki ingestion error in ledger");
