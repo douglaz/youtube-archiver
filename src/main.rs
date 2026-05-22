@@ -961,22 +961,30 @@ impl Ledger {
                 SET wiki_ingested_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
                     wiki_ingest_cmd = ?2,
                     error = CASE
-                        WHEN error LIKE ?5 THEN NULL
+                        WHEN error LIKE ?6 THEN NULL
                         ELSE error
                     END
                 WHERE video_id = ?1
                   AND wiki_path IS ?3
                   AND wiki_emitted_at IS ?4
+                  AND wiki_ingested_at IS ?5
                 "#,
                 params![
                     &row.video_id,
                     rendered_cmd,
                     row.wiki_path.as_deref(),
                     row.wiki_emitted_at.as_deref(),
+                    row.wiki_ingested_at.as_deref(),
                     wiki_error_pattern
                 ],
             )
             .with_context(|| format!("mark {} wiki ingested", row.video_id))?;
+        // The `wiki_ingested_at IS ?5` predicate matches the row state we
+        // snapshotted before invoking the LLM. Two concurrent wiki-ingest
+        // processes will both run the command (wasted tokens), but only
+        // the first UPDATE wins; the second bails here so the row isn't
+        // stamped twice. Without this guard the second writer would
+        // silently overwrite the first's timestamp.
         if updated != 1 {
             bail!(
                 "ledger row changed while wiki ingestion was running for {}",
@@ -2451,12 +2459,18 @@ async fn run_wiki_ingest_command(
     let status = tokio::select! {
         status = child.wait() => {
             match status {
-                // Normal exit: yt-dlp / whisper / claude wait on their
-                // own children before returning, so the process group
-                // is empty by now. Skipping the SIGTERM + 2s grace +
-                // SIGKILL dance saves ~2s per video for the common
-                // happy-path completion.
-                Ok(status) => status,
+                // wiki-ingest runs an arbitrary user-supplied command
+                // template, which may legitimately background work and
+                // exit 0 (e.g. `claude … & disown` style wrappers).
+                // Tear down the process group on normal exit too so
+                // those detached descendants don't outlive the run and
+                // leak into later batches. yt-dlp / whisper run fixed,
+                // well-behaved binaries and skip this; only the
+                // configurable wiki-ingest surface pays the ~2s grace.
+                Ok(status) => {
+                    terminate_command_process_group(process_group, "process exit", &command.rendered).await;
+                    status
+                }
                 Err(err) => {
                     terminate_command_process_group(process_group, "wait error", &command.rendered).await;
                     return Err(err).with_context(|| format!("wait for {}", command.rendered));
