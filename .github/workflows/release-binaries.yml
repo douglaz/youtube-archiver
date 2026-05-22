@@ -199,19 +199,14 @@ jobs:
 
         1. Download the appropriate archive for your platform.
         2. Extract it.
-        3. Linux/macOS: \`chmod +x youtube-archiver && sudo mv youtube-archiver /usr/local/bin/\`
-        4. Windows: move \`youtube-archiver.exe\` somewhere on \`%PATH%\`.
+        3. \`chmod +x youtube-archiver && sudo mv youtube-archiver /usr/local/bin/\`
 
         ### Verify Checksums
 
         Each archive contains a \`.sha256\` file with the binary's checksum.
 
         \`\`\`bash
-        # Linux/macOS
         sha256sum -c youtube-archiver.sha256
-
-        # Windows (PowerShell)
-        Get-FileHash youtube-archiver.exe -Algorithm SHA256
         \`\`\`
 
         ---
