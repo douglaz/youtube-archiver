@@ -1,7 +1,8 @@
 use std::{
     collections::HashSet,
-    path::{Path, PathBuf},
-    process::{Output, Stdio},
+    env, fmt, future,
+    path::{Component, Path, PathBuf},
+    process::{ExitStatus, Output, Stdio},
     sync::{
         Arc, LazyLock,
         atomic::{AtomicU64, Ordering},
@@ -17,20 +18,32 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{
     fs,
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::Command,
+    sync::watch,
+    time::Instant,
 };
 use tracing::{error, info, warn};
 
 const DEFAULT_DATA_DIR: &str = "data";
 const DEFAULT_WHISPER_BIN: &str = "nix run nixpkgs#openai-whisper --";
+const DEFAULT_WIKI_INGEST_CMD: &str = "claude -p \"/wiki:ingest {path}\" --permission-mode acceptEdits --allowedTools \"Bash,Read,Write,Edit,Glob,Grep,Task\"";
+const DEFAULT_WIKI_INGEST_WARNING: &str = "warning: using default wiki ingestion command with Claude Code --permission-mode acceptEdits and Bash/Read/Write/Edit/Glob/Grep/Task tools; review untrusted transcripts or override --wiki-ingest-cmd";
 const DEFAULT_WHISPER_MODEL: &str = "large";
 const DEFAULT_AUDIO_FORMAT: &str = "m4a";
+const DEFAULT_WIKI_INGEST_TIMEOUT_SECS: u64 = 600;
 const STREAMED_OUTPUT_CAPTURE_LIMIT: usize = 64 * 1024;
+const WIKI_INGEST_STDERR_CAPTURE_LIMIT: usize = STREAMED_OUTPUT_CAPTURE_LIMIT;
+const WIKI_INGEST_STDERR_LEDGER_LIMIT: usize = 4 * 1024;
+const WIKI_INGEST_ERROR_PREFIX: &str = "wiki-ingest ";
 #[cfg(not(test))]
 const STREAM_READER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const STREAM_READER_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
+#[cfg(all(unix, not(test)))]
+const PROCESS_GROUP_TERMINATE_GRACE: Duration = Duration::from_secs(2);
+#[cfg(all(unix, test))]
+const PROCESS_GROUP_TERMINATE_GRACE: Duration = Duration::from_millis(100);
 const YOUTUBE_VIDEO_ID_LEN: usize = 11;
 #[cfg(not(target_os = "linux"))]
 const NON_LINUX_STALE_TEMP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
@@ -51,6 +64,8 @@ struct Cli {
 enum Commands {
     /// Download, transcribe, and emit wiki markdown for a video, channel, or playlist URL.
     Ingest(IngestArgs),
+    /// Ingest emitted wiki markdown into llm-wiki.
+    WikiIngest(WikiIngestCommandArgs),
     /// Print a per-video state table.
     Status(DataDirArgs),
     /// List archived videos as JSON.
@@ -91,12 +106,88 @@ struct IngestArgs {
 
     #[arg(long)]
     force: bool,
+
+    #[arg(
+        long,
+        help = "Run llm-wiki ingestion after each emitted wiki article using the configured wiki ingestion command",
+        long_help = "Run llm-wiki ingestion after each emitted wiki article using the configured wiki ingestion command. Unless overridden, the default command runs Claude Code with --permission-mode acceptEdits and allows Bash,Read,Write,Edit,Glob,Grep,Task."
+    )]
+    auto_wiki_ingest: bool,
+
+    #[command(flatten)]
+    wiki_ingest: WikiIngestArgs,
 }
 
 #[derive(Args, Debug)]
 struct DataDirArgs {
     #[arg(long, default_value = DEFAULT_DATA_DIR)]
     data_dir: PathBuf,
+}
+
+#[derive(Args, Debug)]
+struct WikiIngestCommandArgs {
+    #[arg(long, default_value = DEFAULT_DATA_DIR)]
+    data_dir: PathBuf,
+
+    #[command(flatten)]
+    wiki_ingest: WikiIngestArgs,
+
+    #[arg(
+        long,
+        allow_hyphen_values = true,
+        num_args = 1,
+        value_parser = parse_youtube_video_id,
+        help = "Only ingest the emitted wiki article for this video ID"
+    )]
+    video_id: Option<String>,
+
+    #[arg(
+        long,
+        help = "Retry rows whose last wiki-ingest attempt recorded an error; by default they are skipped"
+    )]
+    retry_errors: bool,
+
+    #[arg(long, value_parser = parse_positive_usize, help = "Maximum number of pending wiki articles to ingest")]
+    limit: Option<usize>,
+
+    #[arg(
+        long,
+        help = "Re-ingest rows even when they were already marked ingested; requires an emitted wiki article"
+    )]
+    force: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+struct WikiIngestArgs {
+    #[arg(
+        long,
+        value_name = "TEMPLATE",
+        value_parser = parse_wiki_ingest_template,
+        help = "Wiki ingestion command template containing {path}; used by wiki-ingest or ingest --auto-wiki-ingest",
+        long_help = "Wiki ingestion command template containing {path}; overrides YTARCH_WIKI_INGEST_CMD. Values for {path} and {video_id} are shell-escaped before parsing into an argv (no shell, no pipes, no env-var expansion). The built-in default runs Claude Code with --permission-mode acceptEdits and allows Bash,Read,Write,Edit,Glob,Grep,Task. On the ingest command this option requires --auto-wiki-ingest."
+    )]
+    wiki_ingest_cmd: Option<String>,
+
+    #[arg(
+        long,
+        help = "Working directory for the wiki ingestion command; default: <data-dir>/wiki"
+    )]
+    wiki_ingest_cwd: Option<PathBuf>,
+
+    #[arg(
+        long,
+        value_parser = parse_positive_u64,
+        help = "Wiki ingestion command timeout in seconds; default: 600"
+    )]
+    wiki_ingest_timeout_secs: Option<u64>,
+}
+
+impl WikiIngestArgs {
+    fn has_cli_overrides(&self) -> bool {
+        self.wiki_ingest_cmd.is_some()
+            || self.wiki_ingest_cwd.is_some()
+            || self.wiki_ingest_timeout_secs.is_some()
+    }
 }
 
 fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
@@ -108,6 +199,65 @@ fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
     } else {
         Ok(parsed)
     }
+}
+
+fn parse_positive_u64(value: &str) -> std::result::Result<u64, String> {
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|err| format!("invalid positive integer: {err}"))?;
+    if parsed == 0 {
+        Err("value must be greater than 0".to_owned())
+    } else {
+        Ok(parsed)
+    }
+}
+
+fn parse_wiki_ingest_template(value: &str) -> std::result::Result<String, String> {
+    validate_wiki_ingest_template(value)?;
+    Ok(value.to_owned())
+}
+
+fn parse_youtube_video_id(value: &str) -> std::result::Result<String, String> {
+    if is_valid_youtube_video_id(value) {
+        Ok(value.to_owned())
+    } else {
+        Err(invalid_video_id_error(value))
+    }
+}
+
+fn validate_wiki_ingest_template(value: &str) -> std::result::Result<(), String> {
+    if !template_has_unescaped_path_token(value) {
+        return Err("template must contain {path}".to_owned());
+    }
+
+    let values = WikiIngestTemplateValues {
+        path: "/tmp/youtube archiver/wiki/sample/video \"quoted\".md".to_owned(),
+        video_id: "abc123".to_owned(),
+    };
+    let rendered = render_wiki_ingest_template(value, &values);
+    let argv = shell_words::split(&rendered)
+        .map_err(|err| format!("template must render to a shell-parseable command: {err}"))?;
+    if argv.is_empty() {
+        return Err("template must render to a non-empty command".to_owned());
+    }
+
+    Ok(())
+}
+
+fn template_has_unescaped_path_token(template: &str) -> bool {
+    let mut rest = template;
+    let mut state = ShellRenderState::default();
+    while let Some(index) = rest.find('{') {
+        let literal = &rest[..index];
+        update_shell_render_state(&mut state, literal);
+        let token_start = &rest[index..];
+        if !state.escaped && token_start.starts_with("{path}") {
+            return true;
+        }
+        update_shell_render_state(&mut state, "{");
+        rest = &token_start[1..];
+    }
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +284,168 @@ struct WhisperConfig<'a> {
     bin: &'a str,
     model: &'a str,
     extra_args: &'a [String],
+}
+
+#[derive(Debug)]
+struct WikiIngestConfig {
+    template: String,
+    uses_default_template: bool,
+    cwd: PathBuf,
+    create_cwd_for_preflight: bool,
+    timeout: Duration,
+}
+
+#[derive(Debug)]
+struct WikiIngestBatchOptions<'a> {
+    video_id: Option<&'a str>,
+    retry_errors: bool,
+    limit: Option<usize>,
+    force: bool,
+    missing_plugin_hint_emitted: Option<&'a mut bool>,
+}
+
+#[derive(Debug, Default)]
+struct WikiIngestBatchOutcome {
+    succeeded: usize,
+    skipped: usize,
+    failed: usize,
+}
+
+#[derive(Debug)]
+struct RenderedWikiIngestCommand {
+    rendered: String,
+    program: String,
+    args: Vec<String>,
+}
+
+#[derive(Debug)]
+struct WikiIngestTemplateValues {
+    path: String,
+    video_id: String,
+}
+
+#[derive(Debug)]
+struct WikiIngestCommandOutput {
+    status: ExitStatus,
+    stderr: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CommandProcessGroup {
+    #[cfg(unix)]
+    pgid: libc::pid_t,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ShellRenderState {
+    quote: ShellQuoteContext,
+    escaped: bool,
+}
+
+impl Default for ShellRenderState {
+    fn default() -> Self {
+        Self {
+            quote: ShellQuoteContext::Unquoted,
+            escaped: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ShellQuoteContext {
+    Unquoted,
+    Single,
+    Double,
+}
+
+#[derive(Debug)]
+struct ExitCodeError {
+    code: i32,
+    message: String,
+}
+
+impl ExitCodeError {
+    fn new(code: i32, message: String) -> Self {
+        Self { code, message }
+    }
+}
+
+impl fmt::Display for ExitCodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ExitCodeError {}
+
+#[derive(Debug)]
+struct InterruptedError;
+
+impl fmt::Display for InterruptedError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("wiki ingestion interrupted")
+    }
+}
+
+impl std::error::Error for InterruptedError {}
+
+fn is_interrupted_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<InterruptedError>().is_some()
+}
+
+#[derive(Clone)]
+struct Interrupts {
+    receiver: watch::Receiver<bool>,
+}
+
+impl Interrupts {
+    fn install() -> (Self, AbortOnDrop<()>) {
+        let (sender, receiver) = watch::channel(false);
+        let task = AbortOnDrop::new(tokio::spawn(async move {
+            wait_for_process_interrupt().await;
+            let _ = sender.send(true);
+        }));
+        (Self { receiver }, task)
+    }
+
+    #[cfg(test)]
+    fn inactive() -> Self {
+        let (_sender, receiver) = watch::channel(false);
+        Self { receiver }
+    }
+
+    #[cfg(test)]
+    fn test_channel() -> (Self, watch::Sender<bool>) {
+        let (sender, receiver) = watch::channel(false);
+        (Self { receiver }, sender)
+    }
+
+    fn check(&self) -> Result<()> {
+        if *self.receiver.borrow() {
+            Err(InterruptedError.into())
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn wait(&self) {
+        let mut receiver = self.receiver.clone();
+        wait_for_interrupt(&mut receiver).await;
+    }
+}
+
+async fn wait_for_interrupt(receiver: &mut watch::Receiver<bool>) {
+    if *receiver.borrow() {
+        return;
+    }
+
+    loop {
+        match receiver.changed().await {
+            Ok(()) if *receiver.borrow() => return,
+            Ok(()) => {}
+            Err(_) => future::pending::<()>().await,
+        }
+    }
 }
 
 struct AbortOnDrop<T> {
@@ -178,6 +490,8 @@ struct VideoRow {
     downloaded_at: Option<String>,
     transcribed_at: Option<String>,
     wiki_emitted_at: Option<String>,
+    wiki_ingested_at: Option<String>,
+    wiki_ingest_cmd: Option<String>,
     whisper_model: Option<String>,
     audio_path: Option<String>,
     transcript_path: Option<String>,
@@ -253,6 +567,16 @@ const LEDGER_COLUMNS: &[LedgerColumn] = &[
         migration_sql: None,
     },
     LedgerColumn {
+        name: "wiki_ingested_at",
+        create_sql: "wiki_ingested_at TEXT",
+        migration_sql: Some("ALTER TABLE videos ADD COLUMN wiki_ingested_at TEXT"),
+    },
+    LedgerColumn {
+        name: "wiki_ingest_cmd",
+        create_sql: "wiki_ingest_cmd TEXT",
+        migration_sql: Some("ALTER TABLE videos ADD COLUMN wiki_ingest_cmd TEXT"),
+    },
+    LedgerColumn {
         name: "whisper_model",
         create_sql: "whisper_model TEXT",
         migration_sql: None,
@@ -295,6 +619,7 @@ fn create_videos_table_sql() -> String {
 struct Ledger {
     conn: Connection,
     data_dir: PathBuf,
+    select_columns: String,
 }
 
 impl Ledger {
@@ -306,8 +631,13 @@ impl Ledger {
         let conn = Connection::open(&db_path)
             .with_context(|| format!("open ledger {}", db_path.display()))?;
         configure_connection(&conn)?;
-        let ledger = Self { conn, data_dir };
+        let mut ledger = Self {
+            conn,
+            data_dir,
+            select_columns: String::new(),
+        };
         ledger.init()?;
+        ledger.select_columns = ledger.compute_select_columns_sql()?;
         Ok(ledger)
     }
 
@@ -320,10 +650,13 @@ impl Ledger {
         let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("open ledger read-only {}", db_path.display()))?;
         configure_connection(&conn)?;
-        Ok(Some(Self {
+        let mut ledger = Self {
             conn,
             data_dir: data_dir.to_path_buf(),
-        }))
+            select_columns: String::new(),
+        };
+        ledger.select_columns = ledger.compute_select_columns_sql()?;
+        Ok(Some(ledger))
     }
 
     #[cfg(test)]
@@ -333,9 +666,12 @@ impl Ledger {
             data_dir: std::env::current_dir()
                 .context("read current directory for in-memory ledger")?
                 .join(DEFAULT_DATA_DIR),
+            select_columns: String::new(),
         };
         configure_connection(&ledger.conn)?;
+        let mut ledger = ledger;
         ledger.init()?;
+        ledger.select_columns = ledger.compute_select_columns_sql()?;
         Ok(ledger)
     }
 
@@ -382,6 +718,38 @@ impl Ledger {
         Ok(())
     }
 
+    fn compute_select_columns_sql(&self) -> Result<String> {
+        let existing_columns = self.video_column_names()?;
+        let mut columns = Vec::with_capacity(LEDGER_COLUMNS.len());
+        for column in LEDGER_COLUMNS {
+            if existing_columns.contains(column.name) {
+                columns.push(column.name.to_owned());
+            } else if column.migration_sql.is_some() {
+                columns.push(format!("NULL AS {}", column.name));
+            } else {
+                bail!(
+                    "ledger schema corrupt: videos table is missing required column {}",
+                    column.name
+                );
+            }
+        }
+        Ok(columns.join(", "))
+    }
+
+    fn video_column_names(&self) -> Result<HashSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("PRAGMA table_info(videos)")
+            .context("inspect ledger schema")?;
+        let mut rows = stmt.query([]).context("read ledger schema")?;
+        let mut columns = HashSet::new();
+        while let Some(row) = rows.next().context("read ledger schema row")? {
+            columns.insert(row.get(1).context("read ledger column name")?);
+        }
+        Ok(columns)
+    }
+
+    #[cfg(test)]
     fn ensure_video(&self, video_id: &str, url: &str) -> Result<()> {
         self.conn
             .execute(
@@ -393,6 +761,31 @@ impl Ledger {
                 params![video_id, url],
             )
             .with_context(|| format!("upsert ledger row for {video_id}"))?;
+        Ok(())
+    }
+
+    fn ensure_videos(&self, video_ids: &[String]) -> Result<()> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("begin resolved video ledger transaction")?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    r#"
+                    INSERT INTO videos (video_id, url)
+                    VALUES (?1, ?2)
+                    ON CONFLICT(video_id) DO UPDATE SET url = excluded.url
+                    "#,
+                )
+                .context("prepare resolved video ledger upsert")?;
+            for video_id in video_ids {
+                stmt.execute(params![video_id, canonical_video_url(video_id)])
+                    .with_context(|| format!("upsert ledger row for {video_id}"))?;
+            }
+        }
+        tx.commit()
+            .context("commit resolved video ledger transaction")?;
         Ok(())
     }
 
@@ -439,6 +832,7 @@ impl Ledger {
 
     fn mark_downloaded(&self, video_id: &str, audio_path: &Path) -> Result<()> {
         let audio_path = self.path_to_ledger_string(audio_path)?;
+        let wiki_error_pattern = wiki_ingest_error_like_pattern();
         self.conn
             .execute(
                 r#"
@@ -447,10 +841,15 @@ impl Ledger {
                     audio_path = ?2,
                     transcribed_at = NULL,
                     wiki_emitted_at = NULL,
-                    error = NULL
+                    wiki_ingested_at = NULL,
+                    wiki_ingest_cmd = NULL,
+                    error = CASE
+                        WHEN error LIKE ?3 THEN error
+                        ELSE NULL
+                    END
                 WHERE video_id = ?1
                 "#,
-                params![video_id, audio_path],
+                params![video_id, audio_path, wiki_error_pattern],
             )
             .with_context(|| format!("mark {video_id} downloaded"))?;
         Ok(())
@@ -463,6 +862,7 @@ impl Ledger {
         transcript_path: &Path,
     ) -> Result<()> {
         let transcript_path = self.path_to_ledger_string(transcript_path)?;
+        let wiki_error_pattern = wiki_ingest_error_like_pattern();
         self.conn
             .execute(
                 r#"
@@ -472,10 +872,15 @@ impl Ledger {
                     transcript_path = ?3,
                     -- Preserve wiki_path so re-emission can remove stale slug paths.
                     wiki_emitted_at = NULL,
-                    error = NULL
+                    wiki_ingested_at = NULL,
+                    wiki_ingest_cmd = NULL,
+                    error = CASE
+                        WHEN error LIKE ?4 THEN error
+                        ELSE NULL
+                    END
                 WHERE video_id = ?1
                 "#,
-                params![video_id, whisper_model, transcript_path],
+                params![video_id, whisper_model, transcript_path, wiki_error_pattern],
             )
             .with_context(|| format!("mark {video_id} transcribed"))?;
         Ok(())
@@ -487,7 +892,9 @@ impl Ledger {
                 r#"
                 UPDATE videos
                 SET transcribed_at = NULL,
-                    wiki_emitted_at = NULL
+                    wiki_emitted_at = NULL,
+                    wiki_ingested_at = NULL,
+                    wiki_ingest_cmd = NULL
                 WHERE video_id = ?1
                 "#,
                 params![video_id],
@@ -505,7 +912,9 @@ impl Ledger {
                     wiki_emitted_at = ?3,
                     whisper_model = ?4,
                     transcript_path = ?5,
-                    wiki_path = ?6
+                    wiki_path = ?6,
+                    wiki_ingested_at = ?7,
+                    wiki_ingest_cmd = ?8
                 WHERE video_id = ?1
                 "#,
                 params![
@@ -514,7 +923,9 @@ impl Ledger {
                     row.wiki_emitted_at,
                     row.whisper_model,
                     row.transcript_path,
-                    row.wiki_path
+                    row.wiki_path,
+                    row.wiki_ingested_at,
+                    row.wiki_ingest_cmd
                 ],
             )
             .with_context(|| format!("restore transcription outputs for {}", row.video_id))?;
@@ -529,12 +940,57 @@ impl Ledger {
                 UPDATE videos
                 SET wiki_emitted_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
                     wiki_path = ?2,
+                    wiki_ingested_at = NULL,
+                    wiki_ingest_cmd = NULL,
                     error = NULL
                 WHERE video_id = ?1
                 "#,
                 params![video_id, wiki_path],
             )
             .with_context(|| format!("mark {video_id} wiki emitted"))?;
+        Ok(())
+    }
+
+    fn mark_wiki_ingested(&self, row: &VideoRow, rendered_cmd: &str) -> Result<()> {
+        let wiki_error_pattern = wiki_ingest_error_like_pattern();
+        let updated = self
+            .conn
+            .execute(
+                r#"
+                UPDATE videos
+                SET wiki_ingested_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                    wiki_ingest_cmd = ?2,
+                    error = CASE
+                        WHEN error LIKE ?6 THEN NULL
+                        ELSE error
+                    END
+                WHERE video_id = ?1
+                  AND wiki_path IS ?3
+                  AND wiki_emitted_at IS ?4
+                  AND wiki_ingested_at IS ?5
+                "#,
+                params![
+                    &row.video_id,
+                    rendered_cmd,
+                    row.wiki_path.as_deref(),
+                    row.wiki_emitted_at.as_deref(),
+                    row.wiki_ingested_at.as_deref(),
+                    wiki_error_pattern
+                ],
+            )
+            .with_context(|| format!("mark {} wiki ingested", row.video_id))?;
+        // The `wiki_ingested_at IS ?5` predicate matches the row state we
+        // snapshotted before invoking the LLM. Two concurrent wiki-ingest
+        // processes will both run the command (wasted tokens), but only
+        // the first UPDATE wins; the second bails here so the row isn't
+        // stamped twice. Without this guard the second writer would
+        // silently overwrite the first's timestamp.
+        if updated != 1 {
+            bail!(
+                "ledger row changed while wiki ingestion was running for {}",
+                row.video_id
+            );
+        }
         Ok(())
     }
 
@@ -548,27 +1004,34 @@ impl Ledger {
         Ok(())
     }
 
-    fn clear_stale_error(&self, video_id: &str) -> Result<()> {
+    fn clear_stale_non_wiki_ingest_error(&self, video_id: &str) -> Result<()> {
+        let wiki_error_pattern = wiki_ingest_error_like_pattern();
         self.conn
             .execute(
-                "UPDATE videos SET error = NULL WHERE video_id = ?1 AND error IS NOT NULL",
-                params![video_id],
+                r#"
+                UPDATE videos
+                SET error = NULL
+                WHERE video_id = ?1
+                  AND error IS NOT NULL
+                  AND error NOT LIKE ?2
+                "#,
+                params![video_id, wiki_error_pattern],
             )
-            .with_context(|| format!("clear stale error for {video_id}"))?;
+            .with_context(|| format!("clear stale non-wiki-ingest error for {video_id}"))?;
         Ok(())
     }
 
     fn row(&self, video_id: &str) -> Result<Option<VideoRow>> {
+        let select_columns = &self.select_columns;
         self.conn
             .query_row(
-                r#"
-                SELECT video_id, url, channel_id, channel_title, uploader, title,
-                       upload_date, duration, tags,
-                       downloaded_at, transcribed_at, wiki_emitted_at,
-                       whisper_model, audio_path, transcript_path, wiki_path, error
-                FROM videos
-                WHERE video_id = ?1
-                "#,
+                &format!(
+                    r#"
+                    SELECT {select_columns}
+                    FROM videos
+                    WHERE video_id = ?1
+                    "#
+                ),
                 params![video_id],
                 row_from_sql,
             )
@@ -577,23 +1040,59 @@ impl Ledger {
     }
 
     fn rows(&self) -> Result<Vec<VideoRow>> {
+        let select_columns = &self.select_columns;
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare(&format!(
                 r#"
-                SELECT video_id, url, channel_id, channel_title, uploader, title,
-                       upload_date, duration, tags,
-                       downloaded_at, transcribed_at, wiki_emitted_at,
-                       whisper_model, audio_path, transcript_path, wiki_path, error
+                SELECT {select_columns}
                 FROM videos
                 ORDER BY video_id
-                "#,
-            )
+                "#
+            ))
             .context("prepare ledger list query")?;
         let mut query_rows = stmt
             .query_map([], row_from_sql)
             .context("query ledger rows")?;
         let mut rows = Vec::new();
+        for row in &mut query_rows {
+            match row {
+                Ok(row) => rows.push(row),
+                Err(err) => {
+                    warn!(error = %err, "skipping corrupt ledger row");
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    fn wiki_ingest_rows(&self, retry_errors: bool, force: bool) -> Result<Vec<VideoRow>> {
+        let select_columns = &self.select_columns;
+        let include_ingested = force;
+        let include_errors = force || retry_errors;
+        let include_error_retries = retry_errors;
+        let sql = format!(
+            r#"
+            SELECT {select_columns}
+            FROM videos
+            WHERE wiki_emitted_at IS NOT NULL
+              AND (?1 OR wiki_ingested_at IS NULL OR (?3 AND error IS NOT NULL))
+              AND (?2 OR error IS NULL)
+            ORDER BY video_id
+            "#
+        );
+
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .context("prepare wiki ingest candidate query")?;
+        let mut rows = Vec::new();
+        let mut query_rows = stmt
+            .query_map(
+                params![include_ingested, include_errors, include_error_retries],
+                row_from_sql,
+            )
+            .context("query wiki ingest candidate rows")?;
         for row in &mut query_rows {
             match row {
                 Ok(row) => rows.push(row),
@@ -617,7 +1116,7 @@ fn configure_connection(conn: &Connection) -> Result<()> {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
@@ -626,20 +1125,66 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    match Cli::parse().command {
-        Commands::Ingest(args) => ingest(args).await,
+    let (interrupts, _interrupt_listener) = Interrupts::install();
+    if let Err(err) = run_cli(&interrupts).await {
+        if let Some(exit) = err.downcast_ref::<ExitCodeError>() {
+            eprintln!("{exit}");
+            std::process::exit(exit.code);
+        }
+        if is_interrupted_error(&err) {
+            eprintln!("Interrupted");
+            std::process::exit(130);
+        }
+
+        eprintln!("Error: {err:#}");
+        std::process::exit(1);
+    }
+}
+
+async fn run_cli(interrupts: &Interrupts) -> Result<()> {
+    let mut command = Cli::parse().command;
+    normalize_command_paths(&mut command)?;
+    match command {
+        Commands::Ingest(args) => ingest(args, interrupts).await,
+        Commands::WikiIngest(args) => wiki_ingest(args, interrupts).await,
         Commands::Status(args) => status(args).await,
         Commands::List(args) => list(args).await,
     }
 }
 
-async fn ingest(args: IngestArgs) -> Result<()> {
+fn normalize_command_paths(command: &mut Commands) -> Result<()> {
+    match command {
+        Commands::Ingest(args) => normalize_data_dir(&mut args.data_dir),
+        Commands::WikiIngest(args) => normalize_data_dir(&mut args.data_dir),
+        Commands::Status(args) | Commands::List(args) => normalize_data_dir(&mut args.data_dir),
+    }
+}
+
+fn normalize_data_dir(data_dir: &mut PathBuf) -> Result<()> {
+    let original = data_dir.clone();
+    *data_dir = absolutize_path(&original)
+        .with_context(|| format!("resolve --data-dir {}", original.display()))?;
+    Ok(())
+}
+
+async fn ingest(args: IngestArgs, interrupts: &Interrupts) -> Result<()> {
     validate_whisper_config(&args.whisper_bin, &args.whisper_args)?;
+    reject_ignored_wiki_ingest_options(&args)?;
+    std::fs::create_dir_all(&args.data_dir)
+        .with_context(|| format!("create data dir {}", args.data_dir.display()))?;
+    let wiki_ingest_config = if args.auto_wiki_ingest {
+        Some(wiki_ingest_config(&args.data_dir, &args.wiki_ingest)?)
+    } else {
+        None
+    };
+    if let Some(config) = wiki_ingest_config.as_ref() {
+        warn_if_using_default_wiki_ingest_command(config);
+    }
 
     let ledger = Ledger::open(&args.data_dir)?;
     let mode = classify_youtube_url(&args.url);
     info!(?mode, url = %args.url, "resolving input URL");
-    let video_ids = resolve_video_ids(&args.url, mode, args.limit).await?;
+    let video_ids = resolve_video_ids(&args.url, mode, args.limit, interrupts).await?;
 
     if video_ids.is_empty() {
         bail!("yt-dlp did not return any video IDs for {}", args.url);
@@ -648,30 +1193,49 @@ async fn ingest(args: IngestArgs) -> Result<()> {
     ensure_resolved_videos(&ledger, &video_ids)?;
 
     let mut succeeded = 0usize;
-    let mut failed = 0usize;
     let mut failed_video_ids = Vec::new();
+    let mut missing_plugin_hint_emitted = false;
 
     for video_id in video_ids {
-        match process_video(&args, &ledger, &video_id).await {
+        interrupts.check()?;
+        match process_video(
+            &args,
+            &ledger,
+            &video_id,
+            wiki_ingest_config.as_ref(),
+            Some(&mut missing_plugin_hint_emitted),
+            interrupts,
+        )
+        .await
+        {
             Ok(()) => {
                 succeeded += 1;
                 info!(%video_id, "video processed");
             }
             Err(err) => {
-                failed += 1;
+                if is_interrupted_error(&err) {
+                    return Err(err);
+                }
                 failed_video_ids.push(video_id.clone());
                 let message = format!("{err:#}");
                 error!(%video_id, error = %message, "video failed");
-                if let Err(err) = ledger.mark_error(&video_id, &message) {
+                if should_preserve_recorded_wiki_ingest_error(&ledger, &video_id, &message) {
+                    warn!(%video_id, error = %message, "preserving existing ledger error recorded by failed stage");
+                } else if let Err(err) = ledger.mark_error(&video_id, &message) {
                     warn!(%video_id, error = %err, original_error = %message, "failed to record video error in ledger");
                 }
             }
         }
     }
 
-    if succeeded == 0 {
+    interrupts.check()?;
+    // Per AGENTS.md: nonzero exit only when every attempted video failed.
+    // Already-done re-runs (everything skipped at the stage level) count
+    // as Ok and so as successful attempts.
+    if succeeded == 0 && !failed_video_ids.is_empty() {
         bail!(
-            "every video failed ({failed} failure(s)): {}",
+            "every video failed ({} failure(s)): {}",
+            failed_video_ids.len(),
             failed_video_ids.join(", ")
         );
     }
@@ -679,15 +1243,48 @@ async fn ingest(args: IngestArgs) -> Result<()> {
     Ok(())
 }
 
-fn ensure_resolved_videos(ledger: &Ledger, video_ids: &[String]) -> Result<()> {
-    for video_id in video_ids {
-        ledger.ensure_video(video_id, &canonical_video_url(video_id))?;
+fn reject_ignored_wiki_ingest_options(args: &IngestArgs) -> Result<()> {
+    if !args.auto_wiki_ingest && args.wiki_ingest.has_cli_overrides() {
+        bail!("wiki ingestion options require --auto-wiki-ingest on ingest");
     }
     Ok(())
 }
 
-async fn process_video(args: &IngestArgs, ledger: &Ledger, video_id: &str) -> Result<()> {
-    let metadata = load_or_fetch_metadata(&args.data_dir, ledger, video_id, args.force).await?;
+fn warn_if_using_default_wiki_ingest_command(config: &WikiIngestConfig) {
+    if config.uses_default_template {
+        eprintln!("{DEFAULT_WIKI_INGEST_WARNING}");
+    }
+}
+
+fn should_preserve_recorded_wiki_ingest_error(
+    ledger: &Ledger,
+    video_id: &str,
+    new_error: &str,
+) -> bool {
+    new_error.starts_with(&format!("{WIKI_INGEST_ERROR_PREFIX}{video_id}"))
+        && ledger
+            .row(video_id)
+            .ok()
+            .flatten()
+            .is_some_and(|row| is_wiki_ingest_ledger_error(row.error.as_deref()))
+}
+
+fn ensure_resolved_videos(ledger: &Ledger, video_ids: &[String]) -> Result<()> {
+    ledger.ensure_videos(video_ids)
+}
+
+async fn process_video(
+    args: &IngestArgs,
+    ledger: &Ledger,
+    video_id: &str,
+    wiki_ingest_config: Option<&WikiIngestConfig>,
+    missing_plugin_hint_emitted: Option<&mut bool>,
+    interrupts: &Interrupts,
+) -> Result<()> {
+    interrupts.check()?;
+
+    let metadata =
+        load_or_fetch_metadata(&args.data_dir, ledger, video_id, args.force, interrupts).await?;
 
     let audio_path = download_audio(
         &args.data_dir,
@@ -695,6 +1292,7 @@ async fn process_video(args: &IngestArgs, ledger: &Ledger, video_id: &str) -> Re
         video_id,
         &args.audio_format,
         args.force,
+        interrupts,
     )
     .await
     .with_context(|| format!("download audio for {video_id}"))?;
@@ -710,6 +1308,7 @@ async fn process_video(args: &IngestArgs, ledger: &Ledger, video_id: &str) -> Re
             extra_args: &args.whisper_args,
         },
         args.force,
+        interrupts,
     )
     .await
     .with_context(|| format!("transcribe {video_id}"))?;
@@ -717,8 +1316,31 @@ async fn process_video(args: &IngestArgs, ledger: &Ledger, video_id: &str) -> Re
     emit_wiki_article(&args.data_dir, ledger, &metadata, args.force)
         .await
         .with_context(|| format!("emit wiki markdown for {video_id}"))?;
+    interrupts.check()?;
 
-    if let Err(err) = ledger.clear_stale_error(video_id) {
+    if let Some(config) = wiki_ingest_config {
+        run_wiki_ingest_batch(
+            &args.data_dir,
+            ledger,
+            config,
+            WikiIngestBatchOptions {
+                video_id: Some(video_id),
+                // Auto-ingest only retries rows whose existing error was
+                // recorded by the wiki-ingest stage itself; the engine
+                // re-checks this per row. We pass `true` here so a row
+                // with a prior wiki-ingest failure is eligible.
+                retry_errors: true,
+                limit: None,
+                force: args.force,
+                missing_plugin_hint_emitted,
+            },
+            interrupts,
+        )
+        .await
+        .with_context(|| format!("wiki-ingest {video_id}"))?;
+    }
+
+    if let Err(err) = ledger.clear_stale_non_wiki_ingest_error(video_id) {
         warn!(%video_id, error = %err, "failed to clear stale ledger error after successful processing");
     }
     Ok(())
@@ -728,9 +1350,10 @@ async fn resolve_video_ids(
     url: &str,
     mode: InputMode,
     limit: Option<usize>,
+    interrupts: &Interrupts,
 ) -> Result<Vec<String>> {
     let args = resolve_video_ids_args(url, mode, limit);
-    let output = run_checked("yt-dlp", &args).await?;
+    let output = run_checked("yt-dlp", &args, interrupts).await?;
     let stdout = String::from_utf8(output.stdout).context("yt-dlp emitted non-UTF8 video IDs")?;
     Ok(collect_valid_resolved_video_ids(&stdout, limit))
 }
@@ -795,11 +1418,17 @@ async fn load_or_fetch_metadata(
     ledger: &Ledger,
     video_id: &str,
     force: bool,
+    interrupts: &Interrupts,
 ) -> Result<VideoMetadata> {
     let media_dir = data_dir.join("media").join(video_id);
     let info_path = media_dir.join("info.json");
 
-    if !force && let Some(metadata) = load_cached_metadata(video_id, &info_path).await? {
+    let cached_metadata = if force {
+        None
+    } else {
+        load_cached_metadata(video_id, &info_path).await?
+    };
+    if let Some(metadata) = cached_metadata {
         ledger.upsert_metadata(&metadata)?;
         return Ok(metadata);
     }
@@ -815,7 +1444,7 @@ async fn load_or_fetch_metadata(
         "--".to_owned(),
         url,
     ];
-    let output = run_checked("yt-dlp", &args).await?;
+    let output = run_checked("yt-dlp", &args, interrupts).await?;
     let value: Value = serde_json::from_slice(&output.stdout)
         .with_context(|| format!("parse yt-dlp metadata for {video_id}"))?;
     atomic_write(&info_path, &output.stdout).await?;
@@ -874,6 +1503,7 @@ async fn download_audio(
     video_id: &str,
     audio_format: &str,
     force: bool,
+    interrupts: &Interrupts,
 ) -> Result<PathBuf> {
     if let Some(row) = ledger.row(video_id)?
         && should_skip_download_async(data_dir, &row, audio_format, force).await
@@ -910,7 +1540,7 @@ async fn download_audio(
     ];
 
     let result: Result<PathBuf> = async {
-        run_checked_stream_output("yt-dlp", &args).await?;
+        run_checked_stream_output("yt-dlp", &args, interrupts).await?;
         let downloaded = find_audio_file(&tmp_dir, audio_format).await?;
         let extension = downloaded
             .extension()
@@ -953,6 +1583,7 @@ async fn transcribe_audio(
     audio_path: &Path,
     whisper: WhisperConfig<'_>,
     force: bool,
+    interrupts: &Interrupts,
 ) -> Result<PathBuf> {
     let previous_row = ledger.row(video_id)?;
     if let Some(row) = previous_row.as_ref()
@@ -990,7 +1621,7 @@ async fn transcribe_audio(
     ]);
 
     let result: Result<PathBuf> = async {
-        run_checked_stream_output(&program, &args).await?;
+        run_checked_stream_output(&program, &args, interrupts).await?;
         let output_stem = audio_path
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -1002,9 +1633,10 @@ async fn transcribe_audio(
         if let Err(err) =
             replace_transcript_pair(&whisper_json, &whisper_txt, &final_json, &final_txt).await
         {
-            if let Some(row) = previous_row.as_ref()
-                && let Err(restore_err) = ledger.restore_transcription_outputs(row)
-            {
+            let restore_error = previous_row
+                .as_ref()
+                .and_then(|row| ledger.restore_transcription_outputs(row).err());
+            if let Some(restore_err) = restore_error {
                 warn!(%video_id, error = %restore_err, "failed to restore transcription ledger state after replacement failure");
             }
             return Err(err);
@@ -1094,19 +1726,21 @@ async fn status(args: DataDirArgs) -> Result<()> {
         .unwrap_or_default();
 
     println!(
-        "{:<14} {:<10} {:<11} {:<10} {:<7} title",
-        "video_id", "download", "transcribe", "wiki", "error"
+        "{:<14} {:<10} {:<11} {:<10} {:<8} {:<7} title",
+        "video_id", "download", "transcribe", "wiki", "ingest", "error"
     );
     for row in rows {
         let download = download_state(&args.data_dir, &row).await;
         let transcript = transcript_state(&args.data_dir, &row).await;
         let wiki = wiki_state(&args.data_dir, &row).await;
+        let wiki_ingest = wiki_ingest_state(&args.data_dir, &row).await;
         println!(
-            "{:<14} {:<10} {:<11} {:<10} {:<7} {}",
+            "{:<14} {:<10} {:<11} {:<10} {:<8} {:<7} {}",
             row.video_id,
             download,
             transcript,
             wiki,
+            wiki_ingest,
             if row.error.is_some() { "yes" } else { "-" },
             row.title.as_deref().unwrap_or("-")
         );
@@ -1122,6 +1756,1119 @@ async fn list(args: DataDirArgs) -> Result<()> {
         serde_json::to_string_pretty(&rows).context("serialize archived video rows")?
     );
     Ok(())
+}
+
+async fn wiki_ingest(args: WikiIngestCommandArgs, interrupts: &Interrupts) -> Result<()> {
+    let config = wiki_ingest_config(&args.data_dir, &args.wiki_ingest)?;
+    warn_if_using_default_wiki_ingest_command(&config);
+    let ledger = Ledger::open(&args.data_dir)?;
+    run_wiki_ingest_batch(
+        &args.data_dir,
+        &ledger,
+        &config,
+        WikiIngestBatchOptions {
+            video_id: args.video_id.as_deref(),
+            retry_errors: args.retry_errors,
+            limit: args.limit,
+            force: args.force,
+            missing_plugin_hint_emitted: None,
+        },
+        interrupts,
+    )
+    .await?;
+    Ok(())
+}
+
+fn wiki_ingest_config(data_dir: &Path, args: &WikiIngestArgs) -> Result<WikiIngestConfig> {
+    let (template, uses_default_template) = wiki_ingest_template(args.wiki_ingest_cmd.as_deref())?;
+    let create_cwd_for_preflight = args.wiki_ingest_cwd.is_none();
+    let cwd = match args.wiki_ingest_cwd.as_deref() {
+        Some(cwd) => absolutize_path(cwd)
+            .with_context(|| format!("resolve --wiki-ingest-cwd {}", cwd.display()))?,
+        None => data_dir.join("wiki"),
+    };
+    Ok(WikiIngestConfig {
+        template,
+        uses_default_template,
+        cwd,
+        create_cwd_for_preflight,
+        timeout: Duration::from_secs(
+            args.wiki_ingest_timeout_secs
+                .unwrap_or(DEFAULT_WIKI_INGEST_TIMEOUT_SECS),
+        ),
+    })
+}
+
+fn wiki_ingest_template(cli_template: Option<&str>) -> Result<(String, bool)> {
+    let (template, uses_default_template) = match cli_template {
+        Some(template) => (template.to_owned(), false),
+        None => match env::var("YTARCH_WIKI_INGEST_CMD") {
+            Ok(template) => (template, false),
+            Err(_) => (DEFAULT_WIKI_INGEST_CMD.to_owned(), true),
+        },
+    };
+    validate_wiki_ingest_template(&template).map_err(|err| anyhow!(err))?;
+    Ok((template, uses_default_template))
+}
+
+fn wiki_ingest_error_like_pattern() -> String {
+    format!("{WIKI_INGEST_ERROR_PREFIX}%")
+}
+
+async fn run_wiki_ingest_batch(
+    data_dir: &Path,
+    ledger: &Ledger,
+    config: &WikiIngestConfig,
+    options: WikiIngestBatchOptions<'_>,
+    interrupts: &Interrupts,
+) -> Result<WikiIngestBatchOutcome> {
+    let WikiIngestBatchOptions {
+        video_id,
+        retry_errors,
+        limit,
+        force,
+        missing_plugin_hint_emitted,
+    } = options;
+    let rows =
+        wiki_ingest_candidate_rows(data_dir, ledger, video_id, retry_errors, force, limit).await?;
+    interrupts.check()?;
+    let mut outcome = WikiIngestBatchOutcome::default();
+    if rows.is_empty() {
+        if let Some(video_id) = video_id {
+            let already_ingested = match ledger.row(video_id)? {
+                Some(row) => should_skip_wiki_ingest_async(data_dir, &row, force).await,
+                None => false,
+            };
+            if already_ingested {
+                info!(%video_id, "wiki article already ingested; pass --force to re-ingest");
+            } else {
+                info!(%video_id, "no wiki article pending ingestion");
+            }
+        } else {
+            info!("no wiki articles pending ingestion");
+        }
+        return Ok(outcome);
+    }
+
+    let preflight_command =
+        render_wiki_ingest_preflight_command(data_dir, &config.template, &rows[0])?;
+    preflight_wiki_ingest_command(
+        &preflight_command.program,
+        &config.cwd,
+        config.create_cwd_for_preflight,
+        config.uses_default_template,
+    )
+    .await?;
+
+    let mut failed_video_ids = Vec::new();
+    let mut local_missing_plugin_hint_emitted = false;
+    let missing_plugin_hint_emitted =
+        missing_plugin_hint_emitted.unwrap_or(&mut local_missing_plugin_hint_emitted);
+
+    for row in rows {
+        interrupts.check()?;
+        let row = match ledger.row(&row.video_id) {
+            Ok(Some(refreshed)) => refreshed,
+            Ok(None) => row,
+            Err(err) => {
+                outcome.failed += 1;
+                failed_video_ids.push(row.video_id.clone());
+                let message = format!("{WIKI_INGEST_ERROR_PREFIX}failed: {}", one_line_error(&err));
+                error!(video_id = %row.video_id, error = %message, "wiki ingestion failed");
+                if let Err(err) = ledger.mark_error(&row.video_id, &message) {
+                    warn!(video_id = %row.video_id, error = %err, original_error = %message, "failed to record wiki ingestion error in ledger");
+                }
+                continue;
+            }
+        };
+        if !should_attempt_wiki_ingest_row(data_dir, &row, retry_errors, force).await {
+            outcome.skipped += 1;
+            info!(video_id = %row.video_id, "wiki ingestion skipped because the refreshed row is no longer pending");
+            continue;
+        }
+        // Match `should_attempt_wiki_ingest_row`: only treat an existing
+        // error as retry-eligible when it was recorded by the wiki-ingest
+        // stage itself.
+        let force_for_row =
+            force || (retry_errors && is_wiki_ingest_ledger_error(row.error.as_deref()));
+        if should_skip_wiki_ingest_async(data_dir, &row, force_for_row).await {
+            outcome.skipped += 1;
+            info!(video_id = %row.video_id, "wiki ingestion skipped");
+            continue;
+        }
+
+        let result = run_wiki_ingest_row(data_dir, ledger, config, &row, interrupts).await;
+        match result {
+            Ok(RunWikiIngestRowOutcome::Succeeded) => {
+                outcome.succeeded += 1;
+                info!(video_id = %row.video_id, "wiki ingestion completed");
+            }
+            Ok(RunWikiIngestRowOutcome::CommandFailed { status, stderr }) => {
+                outcome.failed += 1;
+                failed_video_ids.push(row.video_id.clone());
+                let stderr_tail =
+                    stderr_tail_one_line_limited(&stderr, WIKI_INGEST_STDERR_LEDGER_LIMIT);
+                // On the very first per-batch failure with the default
+                // template, print the install hint once. Detecting the
+                // exact failure prose is brittle; the user can disregard
+                // the hint when it's irrelevant.
+                if config.uses_default_template && !*missing_plugin_hint_emitted {
+                    eprintln!("{}", wiki_ingest_install_hint());
+                    *missing_plugin_hint_emitted = true;
+                }
+                let message = format!(
+                    "{WIKI_INGEST_ERROR_PREFIX}exited {}: {}",
+                    exit_status_code(&status),
+                    stderr_tail
+                );
+                error!(video_id = %row.video_id, error = %message, "wiki ingestion failed");
+                if let Err(err) = ledger.mark_error(&row.video_id, &message) {
+                    warn!(video_id = %row.video_id, error = %err, original_error = %message, "failed to record wiki ingestion error in ledger");
+                }
+            }
+            Err(err) => {
+                if is_interrupted_error(&err) {
+                    return Err(err);
+                }
+                let one_line = one_line_error(&err);
+                // The concurrency guard in `mark_wiki_ingested` raises this
+                // when another process won the race and stamped the row
+                // first. The winner already recorded success - persisting
+                // the loser's "row changed" as an error would mask that
+                // and cause `--retry-errors` to re-invoke the LLM.
+                if one_line.contains("ledger row changed while wiki ingestion was running") {
+                    outcome.skipped += 1;
+                    info!(video_id = %row.video_id, "wiki ingestion skipped: row was claimed by a concurrent run");
+                    continue;
+                }
+                outcome.failed += 1;
+                failed_video_ids.push(row.video_id.clone());
+                let message = format!("{WIKI_INGEST_ERROR_PREFIX}failed: {one_line}");
+                error!(video_id = %row.video_id, error = %message, "wiki ingestion failed");
+                if let Err(err) = ledger.mark_error(&row.video_id, &message) {
+                    warn!(video_id = %row.video_id, error = %err, original_error = %message, "failed to record wiki ingestion error in ledger");
+                }
+            }
+        }
+    }
+
+    if outcome.succeeded == 0 && outcome.failed > 0 {
+        bail!(
+            "every wiki ingestion failed ({} failure(s)): {}",
+            outcome.failed,
+            failed_video_ids.join(", ")
+        );
+    }
+
+    Ok(outcome)
+}
+
+#[derive(Debug)]
+enum RunWikiIngestRowOutcome {
+    Succeeded,
+    CommandFailed { status: ExitStatus, stderr: Vec<u8> },
+}
+
+async fn run_wiki_ingest_row(
+    data_dir: &Path,
+    ledger: &Ledger,
+    config: &WikiIngestConfig,
+    row: &VideoRow,
+    interrupts: &Interrupts,
+) -> Result<RunWikiIngestRowOutcome> {
+    let wiki_path = wiki_path_from_row(data_dir, row)?;
+    if !async_fs_path_is_file(wiki_path.clone()).await {
+        bail!("wiki file is missing on disk: {}", wiki_path.display());
+    }
+
+    let command = render_wiki_ingest_command(data_dir, &config.template, row)?;
+    let output = run_wiki_ingest_command(&command, &config.cwd, config.timeout, interrupts).await?;
+    if output.status.success() {
+        ledger.mark_wiki_ingested(row, &command.rendered)?;
+        Ok(RunWikiIngestRowOutcome::Succeeded)
+    } else {
+        Ok(RunWikiIngestRowOutcome::CommandFailed {
+            status: output.status,
+            stderr: output.stderr,
+        })
+    }
+}
+
+async fn wiki_ingest_candidate_rows(
+    data_dir: &Path,
+    ledger: &Ledger,
+    video_id: Option<&str>,
+    retry_errors: bool,
+    force: bool,
+    limit: Option<usize>,
+) -> Result<Vec<VideoRow>> {
+    let rows = match video_id {
+        Some(video_id) => {
+            let row = ledger
+                .row(video_id)?
+                .ok_or_else(|| anyhow!("video {video_id} is not in the ledger"))?;
+            if row.wiki_emitted_at.is_none() {
+                bail!(
+                    "video {video_id} has no emitted wiki article; run ingest first to emit wiki markdown"
+                );
+            }
+            if !force && !retry_errors && row.error.is_some() {
+                bail!(
+                    "video {video_id} has a recorded error; pass --retry-errors to retry it or --force to re-ingest"
+                );
+            }
+            vec![row]
+        }
+        None => ledger.wiki_ingest_rows(retry_errors, force)?,
+    };
+
+    let mut candidates = Vec::new();
+    for row in rows {
+        // Candidate selection happens before the batch lock, so every row is
+        // refreshed and checked again inside run_wiki_ingest_batch.
+        if should_attempt_wiki_ingest_row(data_dir, &row, retry_errors, force).await {
+            candidates.push(row);
+            if candidates.len() == limit.unwrap_or(usize::MAX) {
+                break;
+            }
+        }
+    }
+    Ok(candidates)
+}
+
+async fn should_attempt_wiki_ingest_row(
+    data_dir: &Path,
+    row: &VideoRow,
+    retry_errors: bool,
+    force: bool,
+) -> bool {
+    if row.wiki_emitted_at.is_none() {
+        return false;
+    }
+    // Only retry rows whose existing error was actually recorded by the
+    // wiki-ingest stage. Unrelated errors (stale download, transcript
+    // corruption, ...) must not trigger a paid LLM re-invocation just
+    // because the caller (e.g. `ingest --auto-wiki-ingest`) passes
+    // `retry_errors = true`.
+    let retry_eligible_error = retry_errors && is_wiki_ingest_ledger_error(row.error.as_deref());
+    if !force && !retry_eligible_error && row.error.is_some() {
+        return false;
+    }
+    if force || row.wiki_ingested_at.is_none() || retry_eligible_error {
+        return true;
+    }
+
+    !should_skip_wiki_ingest_async(data_dir, row, false).await
+}
+
+fn render_wiki_ingest_command(
+    data_dir: &Path,
+    template: &str,
+    row: &VideoRow,
+) -> Result<RenderedWikiIngestCommand> {
+    let values = wiki_ingest_template_values(data_dir, row)?;
+    let rendered = render_wiki_ingest_template(template, &values);
+    let argv = shell_words::split(&rendered).context("parse rendered wiki ingestion command")?;
+    let (program, args) = argv
+        .split_first()
+        .ok_or_else(|| anyhow!("wiki ingestion command must not be empty"))?;
+    Ok(RenderedWikiIngestCommand {
+        rendered,
+        program: program.to_owned(),
+        args: args.to_vec(),
+    })
+}
+
+fn render_wiki_ingest_template(template: &str, values: &WikiIngestTemplateValues) -> String {
+    let mut rendered = String::with_capacity(template.len());
+    let mut rest = template;
+    let mut state = ShellRenderState::default();
+
+    while let Some(index) = rest.find('{') {
+        let literal = &rest[..index];
+        rendered.push_str(literal);
+        update_shell_render_state(&mut state, literal);
+        let token_start = &rest[index..];
+        if !state.escaped
+            && let Some((token, value)) = wiki_ingest_template_token(token_start, values)
+        {
+            rendered.push_str(&quote_for_shell_context(value, state.quote));
+            state.escaped = false;
+            rest = &token_start[token.len()..];
+        } else {
+            rendered.push('{');
+            update_shell_render_state(&mut state, "{");
+            rest = &token_start[1..];
+        }
+    }
+    rendered.push_str(rest);
+    rendered
+}
+
+fn update_shell_render_state(state: &mut ShellRenderState, literal: &str) {
+    for ch in literal.chars() {
+        match state.quote {
+            ShellQuoteContext::Unquoted => {
+                if state.escaped {
+                    state.escaped = false;
+                } else if ch == '\\' {
+                    state.escaped = true;
+                } else if ch == '\'' {
+                    state.quote = ShellQuoteContext::Single;
+                } else if ch == '"' {
+                    state.quote = ShellQuoteContext::Double;
+                }
+            }
+            ShellQuoteContext::Single => {
+                if ch == '\'' {
+                    state.quote = ShellQuoteContext::Unquoted;
+                }
+            }
+            ShellQuoteContext::Double => {
+                if state.escaped {
+                    state.escaped = false;
+                } else if ch == '\\' {
+                    state.escaped = true;
+                } else if ch == '"' {
+                    state.quote = ShellQuoteContext::Unquoted;
+                }
+            }
+        }
+    }
+}
+
+fn quote_for_shell_context(value: &str, context: ShellQuoteContext) -> String {
+    match context {
+        ShellQuoteContext::Unquoted => shell_words::quote(value).into_owned(),
+        ShellQuoteContext::Single => value.replace('\'', r#"'\''"#),
+        ShellQuoteContext::Double => {
+            let mut escaped = String::with_capacity(value.len());
+            for ch in value.chars() {
+                if matches!(ch, '\\' | '"' | '$' | '`') {
+                    escaped.push('\\');
+                }
+                escaped.push(ch);
+            }
+            escaped
+        }
+    }
+}
+
+fn wiki_ingest_template_token<'a>(
+    value: &str,
+    values: &'a WikiIngestTemplateValues,
+) -> Option<(&'static str, &'a str)> {
+    if value.starts_with("{path}") {
+        Some(("{path}", &values.path))
+    } else if value.starts_with("{video_id}") {
+        Some(("{video_id}", &values.video_id))
+    } else {
+        None
+    }
+}
+
+fn wiki_ingest_template_values(
+    data_dir: &Path,
+    row: &VideoRow,
+) -> Result<WikiIngestTemplateValues> {
+    let wiki_path = wiki_path_from_row(data_dir, row)?;
+    let absolute_wiki_path = absolutize_path(&wiki_path)?;
+    Ok(WikiIngestTemplateValues {
+        path: path_to_string(&absolute_wiki_path),
+        video_id: row.video_id.clone(),
+    })
+}
+
+fn render_wiki_ingest_preflight_command(
+    data_dir: &Path,
+    template: &str,
+    row: &VideoRow,
+) -> Result<RenderedWikiIngestCommand> {
+    // Preflight renders the template against the first real candidate's
+    // metadata so `command -v` checks the same program we're about to
+    // spawn. The default Claude template doesn't reference row-dependent
+    // tokens in argv[0]; a hand-rolled `--wiki-ingest-cmd` that does will
+    // fail later rows noisily, which is acceptable for a power-user knob.
+    let wiki_path = row
+        .wiki_path
+        .as_deref()
+        .map(|path| ledger_path_to_fs_path(data_dir, path))
+        .unwrap_or_else(|| data_dir.join("wiki").join(".preflight.md"));
+    let absolute_wiki_path = absolutize_path(&wiki_path)?;
+    let values = WikiIngestTemplateValues {
+        path: path_to_string(&absolute_wiki_path),
+        video_id: row.video_id.clone(),
+    };
+    let rendered = render_wiki_ingest_template(template, &values);
+    let argv = shell_words::split(&rendered).context("parse rendered wiki ingestion command")?;
+    let (program, args) = argv
+        .split_first()
+        .ok_or_else(|| anyhow!("wiki ingestion command must not be empty"))?;
+    Ok(RenderedWikiIngestCommand {
+        rendered,
+        program: program.to_owned(),
+        args: args.to_vec(),
+    })
+}
+
+fn wiki_path_from_row(data_dir: &Path, row: &VideoRow) -> Result<PathBuf> {
+    let path = row
+        .wiki_path
+        .as_deref()
+        .ok_or_else(|| anyhow!("ledger row for {} has no wiki_path", row.video_id))?;
+    Ok(ledger_path_to_fs_path(data_dir, path))
+}
+
+async fn preflight_wiki_ingest_command(
+    program: &str,
+    cwd: &Path,
+    create_cwd: bool,
+    uses_default_template: bool,
+) -> Result<()> {
+    if !create_cwd {
+        let metadata = fs::metadata(cwd)
+            .await
+            .with_context(|| format!("wiki ingestion cwd does not exist: {}", cwd.display()))?;
+        if !metadata.is_dir() {
+            bail!("wiki ingestion cwd is not a directory: {}", cwd.display());
+        }
+    }
+
+    if !command_exists(program, cwd).await {
+        return Err(ExitCodeError::new(
+            3,
+            format!(
+                "error: wiki ingestion command not found: '{}'\n{}",
+                program,
+                wiki_ingest_command_not_found_hint(uses_default_template)
+            ),
+        )
+        .into());
+    }
+
+    if create_cwd {
+        fs::create_dir_all(cwd)
+            .await
+            .with_context(|| format!("create wiki ingestion cwd {}", cwd.display()))?;
+    }
+
+    Ok(())
+}
+
+async fn command_exists(program: &str, cwd: &Path) -> bool {
+    let program_path = Path::new(program);
+    if program_path.is_absolute() || program_has_path_separator(program) {
+        return executable_path_exists(&resolve_wiki_ingest_program(program, cwd)).await;
+    }
+
+    let Some(paths) = env::var_os("PATH") else {
+        return false;
+    };
+    for dir in env::split_paths(&paths) {
+        // Relative PATH entries (e.g. `.`, `bin`) are resolved by the
+        // OS against the process cwd at spawn time, but spawn uses
+        // `.current_dir(cwd)` so the executed lookup is actually
+        // relative to the configured wiki-ingest cwd. Mirror that
+        // here so preflight doesn't false-negative on environments
+        // with relative PATH entries.
+        let resolved_dir = if dir.is_absolute() {
+            dir
+        } else {
+            cwd.join(dir)
+        };
+        if executable_path_exists(&resolved_dir.join(program)).await {
+            return true;
+        }
+    }
+    false
+}
+
+/// Resolve a `--wiki-ingest-cmd` program to the path we will hand to
+/// `Command::new`. Keeps the resolution rule identical for preflight
+/// (`command_exists`) and execution (`run_wiki_ingest_command`):
+///
+/// - Absolute path → use as-is.
+/// - Relative path with a separator (e.g. `./ingest.sh`) → resolve
+///   against `cwd` so spawn doesn't depend on Rust/OS quirks around
+///   the `Command::new` + `current_dir` combination (Windows resolves
+///   the executable before the cwd takes effect).
+/// - Bare program (e.g. `claude`) → leave alone; the OS handles `PATH`
+///   resolution.
+fn resolve_wiki_ingest_program(program: &str, cwd: &Path) -> PathBuf {
+    let program_path = Path::new(program);
+    if program_path.is_absolute() {
+        program_path.to_path_buf()
+    } else if program_has_path_separator(program) {
+        cwd.join(program_path)
+    } else {
+        program_path.to_path_buf()
+    }
+}
+
+fn program_has_path_separator(program: &str) -> bool {
+    program.contains(std::path::MAIN_SEPARATOR)
+}
+
+async fn executable_path_exists(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path)
+        .await
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+fn wiki_ingest_install_hint() -> &'static str {
+    "hint: install Claude Code (https://docs.claude.com/en/docs/claude-code/quickstart)\n      then run: claude plugin install wiki@llm-wiki\n      or override with --wiki-ingest-cmd '<your command>'"
+}
+
+fn wiki_ingest_command_not_found_hint(uses_default_template: bool) -> &'static str {
+    if uses_default_template {
+        wiki_ingest_install_hint()
+    } else {
+        "hint: check --wiki-ingest-cmd or YTARCH_WIKI_INGEST_CMD and ensure the command is installed and on PATH"
+    }
+}
+
+async fn run_wiki_ingest_command(
+    command: &RenderedWikiIngestCommand,
+    cwd: &Path,
+    timeout: Duration,
+    interrupts: &Interrupts,
+) -> Result<WikiIngestCommandOutput> {
+    let deadline = std::time::Instant::now()
+        .checked_add(timeout)
+        .map(Instant::from_std)
+        .ok_or_else(|| anyhow!("wiki-ingest timeout is too large: {}s", timeout.as_secs()))?;
+
+    // Resolve cwd-relative executables (e.g. `./ingest.sh`) to an
+    // absolute path BEFORE handing off to Command::new. `Command::new`
+    // combined with `.current_dir(cwd)` has platform-specific behavior
+    // — on Windows the program is resolved before the cwd is applied,
+    // so preflight (which checks `cwd.join(program)`) can pass while
+    // spawn fails. Aligning the resolution rule between preflight and
+    // spawn avoids that drift.
+    let resolved_program = resolve_wiki_ingest_program(&command.program, cwd);
+    let mut child_command = Command::new(&resolved_program);
+    child_command
+        .args(&command.args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    configure_command_process_group(&mut child_command);
+    let mut child = child_command
+        .spawn()
+        .with_context(|| format!("run {}", command.rendered))?;
+    let process_group = match command_child_process_group(&child, &command.rendered) {
+        Ok(process_group) => process_group,
+        Err(err) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(err).with_context(|| {
+                format!(
+                    "configure wiki ingestion process group for {}",
+                    command.rendered
+                )
+            });
+        }
+    };
+
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("capture stdout for {}", command.rendered))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("capture stderr for {}", command.rendered))?;
+    let stdout_progress = Arc::new(AtomicU64::new(0));
+    let stdout_reader_progress = Arc::clone(&stdout_progress);
+    let stdout_task = AbortOnDrop::new(tokio::spawn(async move {
+        let mut captured = Vec::new();
+        let mut truncated = false;
+        let mut chunk = [0u8; 8192];
+        let mut live_stdout = tokio::io::stdout();
+        let mut live_stdout_failed = false;
+
+        loop {
+            let read = stdout.read(&mut chunk).await?;
+            if read == 0 {
+                break;
+            }
+            stdout_reader_progress.fetch_add(1, Ordering::Relaxed);
+            if !live_stdout_failed {
+                match live_stdout.write_all(&chunk[..read]).await {
+                    Ok(()) => {}
+                    Err(err) => {
+                        live_stdout_failed = true;
+                        warn!(stream = "stdout", error = %err, "failed to write child output to live stream");
+                    }
+                }
+            }
+            truncated |= push_captured_output(&mut captured, &chunk[..read]);
+        }
+        if !live_stdout_failed {
+            match live_stdout.flush().await {
+                Ok(()) => {}
+                Err(err) => {
+                    warn!(stream = "stdout", error = %err, "failed to flush child output live stream");
+                }
+            }
+        }
+
+        if truncated {
+            add_truncation_notice(&mut captured, "stdout");
+        }
+
+        Ok::<Vec<u8>, std::io::Error>(captured)
+    }));
+    let stderr_progress = Arc::new(AtomicU64::new(0));
+    let stderr_reader_progress = Arc::clone(&stderr_progress);
+    let stderr_task = AbortOnDrop::new(tokio::spawn(async move {
+        let mut captured = Vec::new();
+        let mut truncated = false;
+        let mut chunk = [0u8; 8192];
+        let mut live_stderr = tokio::io::stderr();
+        let mut live_stderr_failed = false;
+
+        loop {
+            let read = stderr.read(&mut chunk).await?;
+            if read == 0 {
+                break;
+            }
+            stderr_reader_progress.fetch_add(1, Ordering::Relaxed);
+            if !live_stderr_failed {
+                match live_stderr.write_all(&chunk[..read]).await {
+                    Ok(()) => {}
+                    Err(err) => {
+                        live_stderr_failed = true;
+                        warn!(stream = "stderr", error = %err, "failed to write child output to live stream");
+                    }
+                }
+            }
+            truncated |= push_captured_output_with_limit(
+                &mut captured,
+                &chunk[..read],
+                WIKI_INGEST_STDERR_CAPTURE_LIMIT,
+            );
+        }
+        if !live_stderr_failed {
+            match live_stderr.flush().await {
+                Ok(()) => {}
+                Err(err) => {
+                    warn!(stream = "stderr", error = %err, "failed to flush child output live stream");
+                }
+            }
+        }
+        if truncated {
+            add_truncation_notice(&mut captured, "stderr");
+        }
+
+        Ok::<Vec<u8>, std::io::Error>(captured)
+    }));
+
+    let status = tokio::select! {
+        status = child.wait() => {
+            match status {
+                // wiki-ingest runs an arbitrary user-supplied command
+                // template, which may legitimately background work and
+                // exit 0 (e.g. `claude … & disown` style wrappers).
+                // Tear down the process group on normal exit too so
+                // those detached descendants don't outlive the run and
+                // leak into later batches. yt-dlp / whisper run fixed,
+                // well-behaved binaries and skip this; only the
+                // configurable wiki-ingest surface pays the ~2s grace.
+                Ok(status) => {
+                    terminate_command_process_group(process_group, "process exit", &command.rendered).await;
+                    status
+                }
+                Err(err) => {
+                    terminate_command_process_group(process_group, "wait error", &command.rendered).await;
+                    return Err(err).with_context(|| format!("wait for {}", command.rendered));
+                }
+            }
+        }
+        () = tokio::time::sleep_until(deadline) => {
+            kill_timed_out_child(&mut child, process_group, &command.rendered).await;
+            let drain_deadline = Instant::now() + STREAM_READER_DRAIN_TIMEOUT;
+            let (_stdout, stderr) = tokio::join!(
+                join_stream_reader_until(
+                    stdout_task,
+                    "stdout",
+                    &command.rendered,
+                    &stdout_progress,
+                    drain_deadline,
+                ),
+                join_stream_reader_until(
+                    stderr_task,
+                    "stderr",
+                    &command.rendered,
+                    &stderr_progress,
+                    drain_deadline,
+                )
+            );
+            let stderr = stderr.unwrap_or_default();
+            bail!(
+                "wiki-ingest timed out after {}s: {}",
+                timeout.as_secs(),
+                stderr_tail_one_line_limited(&stderr, WIKI_INGEST_STDERR_LEDGER_LIMIT)
+            );
+        }
+        () = interrupts.wait() => {
+            // tokio::select! makes no ordering guarantees, so an interrupt
+            // arriving at the same instant the child exits 0 can win the
+            // race. Before tearing the child down, see if it has actually
+            // finished; if so, treat this as a normal completion so a
+            // successful ingest isn't recorded as an interrupted failure.
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    terminate_command_process_group(process_group, "interrupt-after-exit", &command.rendered).await;
+                    status
+                }
+                _ => {
+                    interrupt_command_child(&mut child, process_group, &command.rendered).await;
+                    let drain_deadline = Instant::now() + STREAM_READER_DRAIN_TIMEOUT;
+                    let (stdout, stderr) = tokio::join!(
+                        join_stream_reader_until(
+                            stdout_task,
+                            "stdout",
+                            &command.rendered,
+                            &stdout_progress,
+                            drain_deadline,
+                        ),
+                        join_stream_reader_until(
+                            stderr_task,
+                            "stderr",
+                            &command.rendered,
+                            &stderr_progress,
+                            drain_deadline,
+                        )
+                    );
+                    if stdout.is_err() || stderr.is_err() {
+                        kill_command_process_group(process_group, "interrupt stream drain failure", &command.rendered);
+                    }
+                    return Err(InterruptedError.into());
+                }
+            }
+        }
+    };
+    let drain_deadline = Instant::now() + STREAM_READER_DRAIN_TIMEOUT;
+    let (stdout, stderr) = tokio::join!(
+        join_stream_reader_until(
+            stdout_task,
+            "stdout",
+            &command.rendered,
+            &stdout_progress,
+            drain_deadline,
+        ),
+        join_stream_reader_until(
+            stderr_task,
+            "stderr",
+            &command.rendered,
+            &stderr_progress,
+            drain_deadline,
+        )
+    );
+    let (_stdout, stderr) = match (stdout, stderr) {
+        (Ok(stdout), Ok(stderr)) => (stdout, stderr),
+        (stdout, stderr) => {
+            kill_command_process_group(process_group, "stream drain failure", &command.rendered);
+            if Instant::now() >= drain_deadline {
+                let stderr = stderr.unwrap_or_default();
+                bail!(
+                    "timed out draining wiki-ingest output after process exit: {}",
+                    stderr_tail_one_line_limited(&stderr, WIKI_INGEST_STDERR_LEDGER_LIMIT)
+                );
+            }
+            (stdout?, stderr?)
+        }
+    };
+
+    Ok(WikiIngestCommandOutput { status, stderr })
+}
+
+fn configure_command_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
+}
+
+fn command_child_process_group(
+    child: &tokio::process::Child,
+    command: &str,
+) -> Result<Option<CommandProcessGroup>> {
+    #[cfg(unix)]
+    {
+        let Some(raw_pid) = child.id() else {
+            warn!(
+                command,
+                "child has no process id; process-group cleanup unavailable"
+            );
+            return Ok(None);
+        };
+        let pid = libc::pid_t::try_from(raw_pid).context("child pid does not fit pid_t")?;
+
+        set_command_child_process_group_from_parent(pid)?;
+
+        for _ in 0..5 {
+            let actual_pgid = unsafe { libc::getpgid(pid) };
+            if actual_pgid == pid {
+                return Ok(Some(CommandProcessGroup { pgid: pid }));
+            }
+            if actual_pgid >= 0 {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ESRCH) {
+                warn!(pid, command, error = %err, "child exited before process group verification completed; retaining expected process group id");
+                return Ok(Some(CommandProcessGroup { pgid: pid }));
+            }
+            return Err(err).with_context(|| format!("verify process group for {command}"));
+        }
+
+        let actual_pgid = unsafe { libc::getpgid(pid) };
+        if actual_pgid == pid {
+            Ok(Some(CommandProcessGroup { pgid: pid }))
+        } else if actual_pgid >= 0 {
+            bail!(
+                "child was not started in its own process group for {command}: pid {pid}, pgid {actual_pgid}"
+            );
+        } else {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ESRCH) {
+                warn!(pid, command, error = %err, "child exited before process group verification completed; retaining expected process group id");
+                Ok(Some(CommandProcessGroup { pgid: pid }))
+            } else {
+                Err(err).with_context(|| format!("verify process group for {command}"))
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = child;
+        let _ = command;
+        Ok(None)
+    }
+}
+
+#[cfg(unix)]
+fn set_command_child_process_group_from_parent(pid: libc::pid_t) -> Result<()> {
+    let result = unsafe { libc::setpgid(pid, pid) };
+    if result == 0 {
+        return Ok(());
+    }
+
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::EACCES | libc::EPERM | libc::ESRCH) => Ok(()),
+        _ => Err(err).context("set child process group"),
+    }
+}
+
+async fn kill_timed_out_child(
+    child: &mut tokio::process::Child,
+    process_group: Option<CommandProcessGroup>,
+    command: &str,
+) {
+    kill_command_process_group(process_group, "timeout", command);
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+}
+
+async fn interrupt_command_child(
+    child: &mut tokio::process::Child,
+    process_group: Option<CommandProcessGroup>,
+    command: &str,
+) {
+    #[cfg(unix)]
+    {
+        if process_group.is_some() {
+            signal_command_process_group(process_group, libc::SIGINT, "interrupt", command);
+        } else {
+            let _ = child.start_kill();
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = process_group;
+        let _ = command;
+        let _ = child.start_kill();
+    }
+
+    match tokio::time::timeout(STREAM_READER_DRAIN_TIMEOUT, child.wait()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(err)) => {
+            warn!(command, error = %err, "failed to wait for interrupted child");
+        }
+        Err(_) => {
+            kill_timed_out_child(child, process_group, command).await;
+        }
+    }
+}
+
+async fn terminate_command_process_group(
+    process_group: Option<CommandProcessGroup>,
+    reason: &'static str,
+    command: &str,
+) {
+    #[cfg(unix)]
+    {
+        if signal_command_process_group(process_group, libc::SIGTERM, reason, command) {
+            tokio::time::sleep(PROCESS_GROUP_TERMINATE_GRACE).await;
+            kill_command_process_group(process_group, reason, command);
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = process_group;
+        let _ = reason;
+        let _ = command;
+    }
+}
+
+fn kill_command_process_group(
+    process_group: Option<CommandProcessGroup>,
+    reason: &'static str,
+    command: &str,
+) {
+    #[cfg(unix)]
+    signal_command_process_group(process_group, libc::SIGKILL, reason, command);
+
+    #[cfg(not(unix))]
+    {
+        let _ = process_group;
+        let _ = reason;
+        let _ = command;
+    }
+}
+
+#[cfg(unix)]
+fn signal_command_process_group(
+    process_group: Option<CommandProcessGroup>,
+    signal: libc::c_int,
+    reason: &'static str,
+    command: &str,
+) -> bool {
+    let Some(process_group) = process_group else {
+        return false;
+    };
+    let result = unsafe { libc::kill(-process_group.pgid, signal) };
+    if result != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::ESRCH) {
+            warn!(
+                pgid = process_group.pgid,
+                signal,
+                reason,
+                command,
+                error = %err,
+                "failed to signal child process group"
+            );
+        }
+        return false;
+    }
+    true
+}
+
+#[cfg(unix)]
+async fn wait_for_process_interrupt() {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut sigint = match signal(SignalKind::interrupt()) {
+        Ok(signal) => Some(signal),
+        Err(err) => {
+            warn!(error = %err, "failed to install SIGINT handler");
+            None
+        }
+    };
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(signal) => Some(signal),
+        Err(err) => {
+            warn!(error = %err, "failed to install SIGTERM handler");
+            None
+        }
+    };
+
+    match (&mut sigint, &mut sigterm) {
+        (Some(sigint), Some(sigterm)) => {
+            tokio::select! {
+                _ = sigint.recv() => {}
+                _ = sigterm.recv() => {}
+            }
+        }
+        (Some(sigint), None) => {
+            let _ = sigint.recv().await;
+        }
+        (None, Some(sigterm)) => {
+            let _ = sigterm.recv().await;
+        }
+        (None, None) => future::pending::<()>().await,
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_process_interrupt() {
+    if let Err(err) = tokio::signal::ctrl_c().await {
+        warn!(error = %err, "failed to install Ctrl-C handler");
+        future::pending::<()>().await;
+    }
+}
+
+fn exit_status_code(status: &ExitStatus) -> String {
+    status
+        .code()
+        .map_or_else(|| status.to_string(), |code| code.to_string())
+}
+
+fn stderr_tail_one_line_limited(stderr: &[u8], limit: usize) -> String {
+    let stderr = if limit == 0 || stderr.len() <= limit {
+        stderr
+    } else {
+        &stderr[stderr.len() - limit..]
+    };
+    let tail = String::from_utf8_lossy(stderr);
+    let tail = escaped_one_line(tail.trim());
+    if tail.is_empty() {
+        "(no stderr)".to_owned()
+    } else {
+        tail
+    }
+}
+
+fn escaped_one_line(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                output.push_str(r"\n");
+            }
+            '\n' => output.push_str(r"\n"),
+            '\t' => output.push_str(r"\t"),
+            ch if ch.is_control() => output.push(' '),
+            ch => output.push(ch),
+        }
+    }
+    output
+}
+
+fn one_line_error(err: &anyhow::Error) -> String {
+    format!("{err:#}")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn is_wiki_ingest_ledger_error(error: Option<&str>) -> bool {
+    error.is_some_and(|error| error.starts_with(WIKI_INGEST_ERROR_PREFIX))
 }
 
 async fn list_rows(data_dir: &Path) -> Result<Vec<VideoRow>> {
@@ -1142,39 +2889,49 @@ async fn is_archived_row(data_dir: &Path, row: &VideoRow) -> bool {
     row.downloaded_at.is_some()
         && row.transcribed_at.is_some()
         && row.wiki_emitted_at.is_some()
-        && row.error.is_none()
+        && row
+            .error
+            .as_deref()
+            .is_none_or(|error| is_wiki_ingest_ledger_error(Some(error)))
         && async_ledger_path_is_file(data_dir, row.audio_path.as_deref()).await
         && async_transcript_paths_exist(data_dir, row.transcript_path.as_deref()).await
         && async_ledger_path_is_file(data_dir, row.wiki_path.as_deref()).await
 }
 
 fn row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<VideoRow> {
-    let duration: Option<i64> = row.get(7)?;
-    let tags_json: Option<String> = row.get(8)?;
+    let tags_column = row.as_ref().column_index("tags")?;
+    let duration: Option<i64> = row.get("duration")?;
+    let tags_json: Option<String> = row.get("tags")?;
     let tags = match tags_json.as_deref() {
         Some(value) => serde_json::from_str(value).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(err))
+            rusqlite::Error::FromSqlConversionFailure(
+                tags_column,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
         })?,
         None => Vec::new(),
     };
     Ok(VideoRow {
-        video_id: row.get(0)?,
-        url: row.get(1)?,
-        channel_id: row.get(2)?,
-        channel_title: row.get(3)?,
-        uploader: row.get(4)?,
-        title: row.get(5)?,
-        upload_date: row.get(6)?,
+        video_id: row.get("video_id")?,
+        url: row.get("url")?,
+        channel_id: row.get("channel_id")?,
+        channel_title: row.get("channel_title")?,
+        uploader: row.get("uploader")?,
+        title: row.get("title")?,
+        upload_date: row.get("upload_date")?,
         duration: duration.and_then(|value| u64::try_from(value).ok()),
         tags,
-        downloaded_at: row.get(9)?,
-        transcribed_at: row.get(10)?,
-        wiki_emitted_at: row.get(11)?,
-        whisper_model: row.get(12)?,
-        audio_path: row.get(13)?,
-        transcript_path: row.get(14)?,
-        wiki_path: row.get(15)?,
-        error: row.get(16)?,
+        downloaded_at: row.get("downloaded_at")?,
+        transcribed_at: row.get("transcribed_at")?,
+        wiki_emitted_at: row.get("wiki_emitted_at")?,
+        wiki_ingested_at: row.get("wiki_ingested_at")?,
+        wiki_ingest_cmd: row.get("wiki_ingest_cmd")?,
+        whisper_model: row.get("whisper_model")?,
+        audio_path: row.get("audio_path")?,
+        transcript_path: row.get("transcript_path")?,
+        wiki_path: row.get("wiki_path")?,
+        error: row.get("error")?,
     })
 }
 
@@ -1484,6 +3241,22 @@ async fn should_skip_wiki_async(data_dir: &Path, row: &VideoRow, force: bool) ->
         && async_ledger_path_is_file(data_dir, row.wiki_path.as_deref()).await
 }
 
+#[cfg(test)]
+fn should_skip_wiki_ingest(data_dir: &Path, row: &VideoRow, force: bool) -> bool {
+    !force
+        && row.wiki_ingested_at.is_some()
+        && row
+            .wiki_path
+            .as_deref()
+            .is_some_and(|path| ledger_path_to_fs_path(data_dir, path).is_file())
+}
+
+async fn should_skip_wiki_ingest_async(data_dir: &Path, row: &VideoRow, force: bool) -> bool {
+    !force
+        && row.wiki_ingested_at.is_some()
+        && async_ledger_path_is_file(data_dir, row.wiki_path.as_deref()).await
+}
+
 async fn async_ledger_path_is_file(data_dir: &Path, path: Option<&str>) -> bool {
     match path {
         Some(path) => async_fs_path_is_file(ledger_path_to_fs_path(data_dir, path)).await,
@@ -1527,6 +3300,24 @@ async fn wiki_state(data_dir: &Path, row: &VideoRow) -> &'static str {
     }
 }
 
+async fn wiki_ingest_state(data_dir: &Path, row: &VideoRow) -> &'static str {
+    if is_wiki_ingest_ledger_error(row.error.as_deref()) {
+        "error"
+    } else if row.wiki_ingested_at.is_some() {
+        if should_skip_wiki_ingest_async(data_dir, row, false).await {
+            "done"
+        } else {
+            "missing"
+        }
+    } else if row.wiki_emitted_at.is_some()
+        && async_ledger_path_is_file(data_dir, row.wiki_path.as_deref()).await
+    {
+        "pending"
+    } else {
+        "-"
+    }
+}
+
 async fn transcript_state(data_dir: &Path, row: &VideoRow) -> &'static str {
     if row.transcribed_at.is_none() {
         "-"
@@ -1544,27 +3335,150 @@ async fn transcript_state(data_dir: &Path, row: &VideoRow) -> &'static str {
     }
 }
 
-async fn run_checked(program: &str, args: &[String]) -> Result<Output> {
-    let output = Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .kill_on_drop(true)
-        .output()
-        .await
-        .with_context(|| format!("run {}", format_command(program, args)))?;
-    ensure_success(program, args, output)
+fn spawn_capture_reader<R>(
+    mut stream: R,
+    progress: Arc<AtomicU64>,
+    stream_name: &'static str,
+) -> AbortOnDrop<std::io::Result<Vec<u8>>>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    AbortOnDrop::new(tokio::spawn(async move {
+        let mut captured = Vec::new();
+        let mut truncated = false;
+        let mut chunk = [0u8; 8192];
+
+        loop {
+            let read = stream.read(&mut chunk).await?;
+            if read == 0 {
+                break;
+            }
+            progress.fetch_add(1, Ordering::Relaxed);
+            truncated |= push_captured_output(&mut captured, &chunk[..read]);
+        }
+
+        if truncated {
+            add_truncation_notice(&mut captured, stream_name);
+        }
+
+        Ok(captured)
+    }))
 }
 
-async fn run_checked_stream_output(program: &str, args: &[String]) -> Result<Output> {
+async fn run_checked(program: &str, args: &[String], interrupts: &Interrupts) -> Result<Output> {
     let command = format_command(program, args);
-    let mut child = Command::new(program)
+    let mut child_command = Command::new(program);
+    child_command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    configure_command_process_group(&mut child_command);
+    let mut child = child_command
         .spawn()
         .with_context(|| format!("run {command}"))?;
+    let process_group = match command_child_process_group(&child, &command) {
+        Ok(process_group) => process_group,
+        Err(err) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(err).with_context(|| format!("configure process group for {command}"));
+        }
+    };
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("capture stdout for {command}"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("capture stderr for {command}"))?;
+    let stdout_progress = Arc::new(AtomicU64::new(0));
+    let stdout_task = spawn_capture_reader(stdout, Arc::clone(&stdout_progress), "stdout");
+    let stderr_progress = Arc::new(AtomicU64::new(0));
+    let stderr_task = spawn_capture_reader(stderr, Arc::clone(&stderr_progress), "stderr");
+
+    let status = tokio::select! {
+        status = child.wait() => {
+            match status {
+                // Normal exit: the child waited on its own descendants
+                // before returning, so skip the SIGTERM + grace +
+                // SIGKILL dance.
+                Ok(status) => status,
+                Err(err) => {
+                    terminate_command_process_group(process_group, "wait error", &command).await;
+                    return Err(err).with_context(|| format!("wait for {command}"));
+                }
+            }
+        }
+        () = interrupts.wait() => {
+            interrupt_command_child(&mut child, process_group, &command).await;
+            let drain_deadline = Instant::now() + STREAM_READER_DRAIN_TIMEOUT;
+            let (stdout, stderr) = tokio::join!(
+                join_stream_reader_until(
+                    stdout_task,
+                    "stdout",
+                    &command,
+                    &stdout_progress,
+                    drain_deadline,
+                ),
+                join_stream_reader_until(
+                    stderr_task,
+                    "stderr",
+                    &command,
+                    &stderr_progress,
+                    drain_deadline,
+                )
+            );
+            // Mirror `run_wiki_ingest_command`: if a descendant kept
+            // pipes open past the drain deadline (ignored SIGINT or
+            // inherited the pipe to a child), escalate to SIGKILL on
+            // the whole process group so we don't leak background
+            // helpers.
+            if stdout.is_err() || stderr.is_err() {
+                kill_command_process_group(process_group, "interrupt stream drain failure", &command);
+            }
+            return Err(InterruptedError.into());
+        }
+    };
+    let stdout = join_stream_reader(stdout_task, "stdout", &command, &stdout_progress).await?;
+    let stderr = join_stream_reader(stderr_task, "stderr", &command, &stderr_progress).await?;
+
+    let output = Output {
+        status,
+        stdout,
+        stderr,
+    };
+    ensure_success(program, args, output)
+}
+
+async fn run_checked_stream_output(
+    program: &str,
+    args: &[String],
+    interrupts: &Interrupts,
+) -> Result<Output> {
+    let command = format_command(program, args);
+    let mut child_command = Command::new(program);
+    child_command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    configure_command_process_group(&mut child_command);
+    let mut child = child_command
+        .spawn()
+        .with_context(|| format!("run {command}"))?;
+    let process_group = match command_child_process_group(&child, &command) {
+        Ok(process_group) => process_group,
+        Err(err) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(err).with_context(|| format!("configure process group for {command}"));
+        }
+    };
     let mut stdout = child
         .stdout
         .take()
@@ -1589,14 +3503,24 @@ async fn run_checked_stream_output(program: &str, args: &[String]) -> Result<Out
                 break;
             }
             stdout_reader_progress.fetch_add(1, Ordering::Relaxed);
-            if !live_stdout_failed && let Err(err) = live_stdout.write_all(&chunk[..read]).await {
-                live_stdout_failed = true;
-                warn!(stream = "stdout", error = %err, "failed to write child output to live stream");
+            if !live_stdout_failed {
+                match live_stdout.write_all(&chunk[..read]).await {
+                    Ok(()) => {}
+                    Err(err) => {
+                        live_stdout_failed = true;
+                        warn!(stream = "stdout", error = %err, "failed to write child output to live stream");
+                    }
+                }
             }
             truncated |= push_captured_output(&mut captured, &chunk[..read]);
         }
-        if !live_stdout_failed && let Err(err) = live_stdout.flush().await {
-            warn!(stream = "stdout", error = %err, "failed to flush child output live stream");
+        if !live_stdout_failed {
+            match live_stdout.flush().await {
+                Ok(()) => {}
+                Err(err) => {
+                    warn!(stream = "stdout", error = %err, "failed to flush child output live stream");
+                }
+            }
         }
 
         if truncated {
@@ -1620,14 +3544,24 @@ async fn run_checked_stream_output(program: &str, args: &[String]) -> Result<Out
                 break;
             }
             stderr_reader_progress.fetch_add(1, Ordering::Relaxed);
-            if !live_stderr_failed && let Err(err) = live_stderr.write_all(&chunk[..read]).await {
-                live_stderr_failed = true;
-                warn!(stream = "stderr", error = %err, "failed to write child output to live stream");
+            if !live_stderr_failed {
+                match live_stderr.write_all(&chunk[..read]).await {
+                    Ok(()) => {}
+                    Err(err) => {
+                        live_stderr_failed = true;
+                        warn!(stream = "stderr", error = %err, "failed to write child output to live stream");
+                    }
+                }
             }
             truncated |= push_captured_output(&mut captured, &chunk[..read]);
         }
-        if !live_stderr_failed && let Err(err) = live_stderr.flush().await {
-            warn!(stream = "stderr", error = %err, "failed to flush child output live stream");
+        if !live_stderr_failed {
+            match live_stderr.flush().await {
+                Ok(()) => {}
+                Err(err) => {
+                    warn!(stream = "stderr", error = %err, "failed to flush child output live stream");
+                }
+            }
         }
 
         if truncated {
@@ -1637,10 +3571,49 @@ async fn run_checked_stream_output(program: &str, args: &[String]) -> Result<Out
         Ok::<Vec<u8>, std::io::Error>(captured)
     }));
 
-    let status = child
-        .wait()
-        .await
-        .with_context(|| format!("wait for {command}"))?;
+    let status = tokio::select! {
+        status = child.wait() => {
+            match status {
+                // Normal exit: the child waited on its own descendants
+                // before returning, so skip the SIGTERM + grace +
+                // SIGKILL dance.
+                Ok(status) => status,
+                Err(err) => {
+                    terminate_command_process_group(process_group, "wait error", &command).await;
+                    return Err(err).with_context(|| format!("wait for {command}"));
+                }
+            }
+        }
+        () = interrupts.wait() => {
+            interrupt_command_child(&mut child, process_group, &command).await;
+            let drain_deadline = Instant::now() + STREAM_READER_DRAIN_TIMEOUT;
+            let (stdout, stderr) = tokio::join!(
+                join_stream_reader_until(
+                    stdout_task,
+                    "stdout",
+                    &command,
+                    &stdout_progress,
+                    drain_deadline,
+                ),
+                join_stream_reader_until(
+                    stderr_task,
+                    "stderr",
+                    &command,
+                    &stderr_progress,
+                    drain_deadline,
+                )
+            );
+            // Mirror `run_wiki_ingest_command`: if a descendant kept
+            // pipes open past the drain deadline (ignored SIGINT or
+            // inherited the pipe to a child), escalate to SIGKILL on
+            // the whole process group so we don't leak background
+            // helpers.
+            if stdout.is_err() || stderr.is_err() {
+                kill_command_process_group(process_group, "interrupt stream drain failure", &command);
+            }
+            return Err(InterruptedError.into());
+        }
+    };
     let stdout = join_stream_reader(stdout_task, "stdout", &command, &stdout_progress).await?;
     let stderr = join_stream_reader(stderr_task, "stderr", &command, &stderr_progress).await?;
 
@@ -1682,16 +3655,56 @@ async fn join_stream_reader(
     }
 }
 
+async fn join_stream_reader_until(
+    mut task: AbortOnDrop<std::io::Result<Vec<u8>>>,
+    stream_name: &str,
+    command: &str,
+    stream_progress: &AtomicU64,
+    deadline: Instant,
+) -> Result<Vec<u8>> {
+    let mut observed_progress = stream_progress.load(Ordering::Relaxed);
+
+    loop {
+        let drain_timeout = tokio::time::sleep(STREAM_READER_DRAIN_TIMEOUT);
+        let command_timeout = tokio::time::sleep_until(deadline);
+        tokio::pin!(drain_timeout);
+        tokio::pin!(command_timeout);
+
+        tokio::select! {
+            join_result = task.handle_mut() => {
+                task.clear_completed();
+                return join_result
+                    .with_context(|| format!("join child {stream_name} reader"))?
+                    .with_context(|| format!("stream {stream_name} from {command}"));
+            }
+            () = &mut drain_timeout => {
+                let current_progress = stream_progress.load(Ordering::Relaxed);
+                if current_progress == observed_progress {
+                    bail!("timed out draining {stream_name} from {command}");
+                }
+                observed_progress = current_progress;
+            }
+            () = &mut command_timeout => {
+                bail!("timed out draining {stream_name} from {command}");
+            }
+        }
+    }
+}
+
 fn push_captured_output(captured: &mut Vec<u8>, chunk: &[u8]) -> bool {
-    if chunk.len() > STREAMED_OUTPUT_CAPTURE_LIMIT {
+    push_captured_output_with_limit(captured, chunk, STREAMED_OUTPUT_CAPTURE_LIMIT)
+}
+
+fn push_captured_output_with_limit(captured: &mut Vec<u8>, chunk: &[u8], limit: usize) -> bool {
+    if chunk.len() > limit {
         captured.clear();
-        captured.extend_from_slice(&chunk[chunk.len() - STREAMED_OUTPUT_CAPTURE_LIMIT..]);
+        captured.extend_from_slice(&chunk[chunk.len() - limit..]);
         return true;
     }
 
     let mut truncated = false;
-    if captured.len() + chunk.len() > STREAMED_OUTPUT_CAPTURE_LIMIT {
-        let excess = captured.len() + chunk.len() - STREAMED_OUTPUT_CAPTURE_LIMIT;
+    if captured.len() + chunk.len() > limit {
+        let excess = captured.len() + chunk.len() - limit;
         captured.drain(..excess);
         truncated = true;
     }
@@ -1966,12 +3979,17 @@ async fn remove_stale_wiki_article(
             fs::remove_file(&previous_path).await.with_context(|| {
                 format!("remove stale wiki article {}", previous_path.display())
             })?;
-            if let Some(parent) = previous_path.parent()
-                && let Err(err) = fs::remove_dir(parent).await
-                && err.kind() != std::io::ErrorKind::NotFound
-                && err.kind() != std::io::ErrorKind::DirectoryNotEmpty
-            {
-                warn!(path = %parent.display(), error = %err, "failed to remove empty wiki directory");
+            if let Some(parent) = previous_path.parent() {
+                match fs::remove_dir(parent).await {
+                    Ok(()) => {}
+                    Err(err)
+                        if err.kind() != std::io::ErrorKind::NotFound
+                            && err.kind() != std::io::ErrorKind::DirectoryNotEmpty =>
+                    {
+                        warn!(path = %parent.display(), error = %err, "failed to remove empty wiki directory");
+                    }
+                    Err(_) => {}
+                }
             }
         }
         Ok(_) => {
@@ -2344,26 +4362,57 @@ fn normalize_ledger_path_string(data_dir: &Path, path: &str) -> Result<String> {
     if path.is_absolute() {
         path_to_ledger_string(data_dir, path)
     } else {
-        Ok(path_to_string(path))
+        Ok(path_to_string(&normalize_path_lexically(path)))
     }
 }
 
 fn ledger_path_to_fs_path(data_dir: &Path, path: &str) -> PathBuf {
     let path = Path::new(path);
     if path.is_absolute() {
-        path.to_path_buf()
+        normalize_path_lexically(path)
     } else {
-        data_dir.join(path)
+        normalize_path_lexically(&data_dir.join(path))
     }
 }
 
 fn absolutize_path(path: &Path) -> Result<PathBuf> {
-    if path.is_absolute() {
-        Ok(path.to_path_buf())
+    let path = if path.is_absolute() {
+        path.to_path_buf()
     } else {
-        Ok(std::env::current_dir()
+        std::env::current_dir()
             .context("read current directory for ledger path")?
-            .join(path))
+            .join(path)
+    };
+    Ok(normalize_path_lexically(&path))
+}
+
+fn normalize_path_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::Normal(part) => normalized.push(part),
+            Component::ParentDir => {
+                let last = normalized.components().next_back();
+                match last {
+                    Some(Component::Normal(_)) => {
+                        normalized.pop();
+                    }
+                    Some(Component::ParentDir) | None => {
+                        if !normalized.has_root() {
+                            normalized.push("..");
+                        }
+                    }
+                    Some(Component::Prefix(_) | Component::RootDir | Component::CurDir) => {}
+                }
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        normalized
     }
 }
 
@@ -2390,11 +4439,21 @@ mod tests {
             downloaded_at: None,
             transcribed_at: None,
             wiki_emitted_at: None,
+            wiki_ingested_at: None,
+            wiki_ingest_cmd: None,
             whisper_model: None,
             audio_path: None,
             transcript_path: None,
             wiki_path: None,
             error: None,
+        }
+    }
+
+    fn default_wiki_ingest_args() -> WikiIngestArgs {
+        WikiIngestArgs {
+            wiki_ingest_cmd: None,
+            wiki_ingest_cwd: None,
+            wiki_ingest_timeout_secs: None,
         }
     }
 
@@ -2586,6 +4645,214 @@ mod tests {
             panic!("expected ingest command");
         };
         assert_eq!(args.whisper_args, ["--language", "en"]);
+    }
+
+    #[test]
+    fn parse_wiki_ingest_cmd_rejects_templates_without_path() {
+        let result = Cli::try_parse_from([
+            "youtube-archiver",
+            "wiki-ingest",
+            "--wiki-ingest-cmd",
+            "claude -p /wiki:ingest",
+        ]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_wiki_ingest_cmd_rejects_escaped_path_token() {
+        let result = Cli::try_parse_from([
+            "youtube-archiver",
+            "wiki-ingest",
+            "--wiki-ingest-cmd",
+            r"printf \{path}",
+        ]);
+
+        let err = result.expect_err("escaped path token should not count as a template token");
+        assert!(err.to_string().contains("template must contain {path}"));
+    }
+
+    #[test]
+    fn parse_wiki_ingest_cmd_rejects_shell_unparseable_templates() {
+        let result = Cli::try_parse_from([
+            "youtube-archiver",
+            "wiki-ingest",
+            "--wiki-ingest-cmd",
+            "claude -p \"/wiki:ingest {path}",
+        ]);
+
+        let err = result.expect_err("unclosed quote should fail clap validation");
+        assert!(err.to_string().contains("shell-parseable command"));
+    }
+
+    #[test]
+    fn parses_wiki_ingest_limit() {
+        let cli = Cli::try_parse_from(["youtube-archiver", "wiki-ingest", "--limit", "2"])
+            .expect("wiki ingest limit should parse");
+
+        let Commands::WikiIngest(args) = cli.command else {
+            panic!("expected wiki-ingest command");
+        };
+        assert_eq!(args.limit, Some(2));
+    }
+
+    #[test]
+    fn parses_hyphen_leading_wiki_ingest_video_id() {
+        let cli = Cli::try_parse_from([
+            "youtube-archiver",
+            "wiki-ingest",
+            "--video-id",
+            "-abc1234567",
+        ])
+        .expect("hyphen-leading video id should parse");
+
+        let Commands::WikiIngest(args) = cli.command else {
+            panic!("expected wiki-ingest command");
+        };
+        assert_eq!(args.video_id.as_deref(), Some("-abc1234567"));
+    }
+
+    #[test]
+    fn rejects_zero_wiki_ingest_limit() {
+        let result = Cli::try_parse_from(["youtube-archiver", "wiki-ingest", "--limit", "0"]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parses_auto_wiki_ingest_args_on_ingest() {
+        let cli = Cli::try_parse_from([
+            "youtube-archiver",
+            "ingest",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "--auto-wiki-ingest",
+            "--wiki-ingest-cmd",
+            "sh -c \"test -f {path}\"",
+            "--wiki-ingest-cwd",
+            "/tmp/wiki",
+            "--wiki-ingest-timeout-secs",
+            "12",
+        ])
+        .expect("auto wiki ingest args should parse");
+
+        let Commands::Ingest(args) = cli.command else {
+            panic!("expected ingest command");
+        };
+        assert!(args.auto_wiki_ingest);
+        assert_eq!(
+            args.wiki_ingest.wiki_ingest_cmd.as_deref(),
+            Some("sh -c \"test -f {path}\"")
+        );
+        assert_eq!(
+            args.wiki_ingest.wiki_ingest_cwd.as_deref(),
+            Some(Path::new("/tmp/wiki"))
+        );
+        assert_eq!(args.wiki_ingest.wiki_ingest_timeout_secs, Some(12));
+    }
+
+    #[test]
+    fn rejects_wiki_ingest_args_that_ingest_would_ignore_without_auto_flag() {
+        let cli = Cli::try_parse_from([
+            "youtube-archiver",
+            "ingest",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "--wiki-ingest-timeout-secs",
+            "12",
+        ])
+        .expect("wiki ingest args should still parse without auto flag");
+
+        let Commands::Ingest(args) = cli.command else {
+            panic!("expected ingest command");
+        };
+        assert!(!args.auto_wiki_ingest);
+        assert!(args.wiki_ingest.has_cli_overrides());
+        assert_eq!(args.wiki_ingest.wiki_ingest_timeout_secs, Some(12));
+
+        let err = reject_ignored_wiki_ingest_options(&args)
+            .expect_err("ingest should reject wiki options without --auto-wiki-ingest");
+        assert!(format!("{err:#}").contains("require --auto-wiki-ingest"));
+    }
+
+    #[test]
+    fn render_wiki_ingest_template_substitutes_and_quotes_tokens() -> Result<()> {
+        let values = WikiIngestTemplateValues {
+            path: "/tmp/wiki dir/{video_id}/video's file.md".to_owned(),
+            video_id: "abc123".to_owned(),
+        };
+        let template = "cmd {path} {video_id}";
+
+        let rendered = render_wiki_ingest_template(template, &values);
+
+        assert_eq!(
+            rendered,
+            format!("cmd {} abc123", shell_words::quote(&values.path))
+        );
+        let argv = shell_words::split(&rendered)?;
+        assert_eq!(argv[1], values.path);
+        assert_eq!(argv[2], values.video_id);
+        Ok(())
+    }
+
+    #[test]
+    fn render_wiki_ingest_template_quotes_path_inside_quotes() -> Result<()> {
+        let values = WikiIngestTemplateValues {
+            path: "/tmp/wiki dir/video \"quoted\" $file.md".to_owned(),
+            video_id: "abc123".to_owned(),
+        };
+
+        let rendered =
+            render_wiki_ingest_template("cmd \"/wiki:ingest {path}\" '{video_id}'", &values);
+        let argv = shell_words::split(&rendered)?;
+
+        assert_eq!(argv[1], format!("/wiki:ingest {}", values.path));
+        assert_eq!(argv[2], values.video_id);
+        Ok(())
+    }
+
+    #[test]
+    fn render_wiki_ingest_template_leaves_escaped_tokens_literal() -> Result<()> {
+        let values = WikiIngestTemplateValues {
+            path: "/tmp/wiki dir/abc123.md".to_owned(),
+            video_id: "abc123".to_owned(),
+        };
+
+        let rendered = render_wiki_ingest_template(r#"cmd \{path} '{video_id}'"#, &values);
+        let argv = shell_words::split(&rendered)?;
+
+        assert_eq!(argv[1], "{path}");
+        assert_eq!(argv[2], values.video_id);
+        Ok(())
+    }
+
+    #[test]
+    fn stderr_tail_preserves_line_structure_on_one_line() {
+        let stderr = b"  first line\n  {\"error\":\"bad value\"}\r\nthird\tline  ";
+
+        assert_eq!(
+            stderr_tail_one_line_limited(stderr, stderr.len()),
+            r#"first line\n  {"error":"bad value"}\nthird\tline"#
+        );
+    }
+
+    #[test]
+    fn default_wiki_ingest_template_keeps_slash_command_path_in_one_arg() -> Result<()> {
+        let values = WikiIngestTemplateValues {
+            path: "/tmp/wiki dir/video \"quoted\" file.md".to_owned(),
+            video_id: "abc123".to_owned(),
+        };
+
+        let rendered = render_wiki_ingest_template(DEFAULT_WIKI_INGEST_CMD, &values);
+        let argv = shell_words::split(&rendered)?;
+
+        assert_eq!(argv[0], "claude");
+        assert_eq!(argv[1], "-p");
+        assert_eq!(argv[2], format!("/wiki:ingest {}", values.path));
+        let allowed_tools = argv
+            .windows(2)
+            .find_map(|pair| (pair[0] == "--allowedTools").then_some(pair[1].as_str()))
+            .expect("default command should include --allowedTools");
+        assert_eq!(allowed_tools, "Bash,Read,Write,Edit,Glob,Grep,Task");
+        Ok(())
     }
 
     #[test]
@@ -2792,6 +5059,272 @@ mod tests {
     }
 
     #[test]
+    fn ledger_migrates_wiki_ingest_columns() -> Result<()> {
+        let dir = tempdir()?;
+        std::fs::create_dir_all(dir.path())?;
+        let conn = Connection::open(dir.path().join("state.sqlite"))?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE videos (
+                video_id TEXT PRIMARY KEY,
+                url TEXT NOT NULL,
+                channel_id TEXT,
+                channel_title TEXT,
+                uploader TEXT,
+                title TEXT,
+                upload_date TEXT,
+                duration INTEGER,
+                tags TEXT,
+                downloaded_at TEXT,
+                transcribed_at TEXT,
+                wiki_emitted_at TEXT,
+                whisper_model TEXT,
+                audio_path TEXT,
+                transcript_path TEXT,
+                wiki_path TEXT,
+                error TEXT
+            );
+            INSERT INTO videos (video_id, url)
+            VALUES ('abc123', 'https://www.youtube.com/watch?v=abc123');
+            "#,
+        )?;
+        drop(conn);
+
+        let ledger = Ledger::open(dir.path())?;
+        let row = ledger.row("abc123")?.expect("row exists");
+
+        assert!(row.wiki_ingested_at.is_none());
+        assert!(row.wiki_ingest_cmd.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn ledger_read_only_reads_legacy_rows_without_wiki_ingest_columns() -> Result<()> {
+        let dir = tempdir()?;
+        std::fs::create_dir_all(dir.path())?;
+        let conn = Connection::open(dir.path().join("state.sqlite"))?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE videos (
+                video_id TEXT PRIMARY KEY,
+                url TEXT NOT NULL,
+                channel_id TEXT,
+                channel_title TEXT,
+                uploader TEXT,
+                title TEXT,
+                upload_date TEXT,
+                duration INTEGER,
+                tags TEXT,
+                downloaded_at TEXT,
+                transcribed_at TEXT,
+                wiki_emitted_at TEXT,
+                whisper_model TEXT,
+                audio_path TEXT,
+                transcript_path TEXT,
+                wiki_path TEXT,
+                error TEXT
+            );
+            INSERT INTO videos (video_id, url, title, tags)
+            VALUES ('abc123', 'https://www.youtube.com/watch?v=abc123', 'Legacy', '["rust"]');
+            "#,
+        )?;
+        drop(conn);
+
+        let ledger = Ledger::open_read_only(dir.path())?.expect("ledger exists");
+        let rows = ledger.rows()?;
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].title.as_deref(), Some("Legacy"));
+        assert_eq!(rows[0].tags, vec!["rust".to_owned()]);
+        assert!(rows[0].wiki_ingested_at.is_none());
+        assert!(rows[0].wiki_ingest_cmd.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn ledger_read_only_reports_missing_required_columns() -> Result<()> {
+        let dir = tempdir()?;
+        let conn = Connection::open(dir.path().join("state.sqlite"))?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE videos (
+                video_id TEXT PRIMARY KEY
+            );
+            INSERT INTO videos (video_id) VALUES ('abc123');
+            "#,
+        )?;
+        drop(conn);
+
+        let err = match Ledger::open_read_only(dir.path()) {
+            Ok(_) => bail!("missing required schema column should fail fast"),
+            Err(err) => err,
+        };
+
+        assert!(format!("{err:#}").contains("missing required column url"));
+        Ok(())
+    }
+
+    #[test]
+    fn mark_wiki_ingested_sets_columns_and_clears_wiki_error() -> Result<()> {
+        let ledger = Ledger::open_in_memory()?;
+        let video_id = "abc123";
+        ledger.ensure_video(video_id, &canonical_video_url(video_id))?;
+        ledger.mark_wiki_emitted(video_id, Path::new("wiki/foo/abc123.md"))?;
+        ledger.mark_error(video_id, "wiki-ingest exited 1: previous failure")?;
+        let row = ledger.row(video_id)?.expect("row exists");
+
+        ledger.mark_wiki_ingested(&row, "claude -p '/wiki:ingest path'")?;
+        let row = ledger.row(video_id)?.expect("row exists");
+
+        assert!(row.wiki_ingested_at.is_some());
+        assert_eq!(
+            row.wiki_ingest_cmd.as_deref(),
+            Some("claude -p '/wiki:ingest path'")
+        );
+        assert!(row.error.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn mark_wiki_ingested_preserves_unrelated_stage_error() -> Result<()> {
+        let ledger = Ledger::open_in_memory()?;
+        let video_id = "abc123";
+        ledger.ensure_video(video_id, &canonical_video_url(video_id))?;
+        ledger.mark_wiki_emitted(video_id, Path::new("wiki/foo/abc123.md"))?;
+        ledger.mark_error(video_id, "download failed")?;
+        let row = ledger.row(video_id)?.expect("row exists");
+
+        ledger.mark_wiki_ingested(&row, "claude -p '/wiki:ingest path'")?;
+        let row = ledger.row(video_id)?.expect("row exists");
+
+        assert!(row.wiki_ingested_at.is_some());
+        assert_eq!(row.error.as_deref(), Some("download failed"));
+        Ok(())
+    }
+
+    #[test]
+    fn mark_wiki_ingested_rejects_changed_wiki_row() -> Result<()> {
+        let ledger = Ledger::open_in_memory()?;
+        let video_id = "abc123";
+        ledger.ensure_video(video_id, &canonical_video_url(video_id))?;
+        ledger.mark_wiki_emitted(video_id, Path::new("wiki/old/abc123.md"))?;
+        let old_row = ledger.row(video_id)?.expect("row exists");
+        ledger.mark_wiki_emitted(video_id, Path::new("wiki/new/abc123.md"))?;
+
+        let err = ledger
+            .mark_wiki_ingested(&old_row, "claude -p '/wiki:ingest old'")
+            .expect_err("stale wiki row should not be marked ingested");
+        let row = ledger.row(video_id)?.expect("row exists");
+
+        assert!(format!("{err:#}").contains("ledger row changed"));
+        assert!(row.wiki_ingested_at.is_none());
+        assert!(row.wiki_ingest_cmd.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wiki_ingest_command_success_fails_when_ledger_update_fails() -> Result<()> {
+        let dir = tempdir()?;
+        let ledger = Ledger::open(dir.path())?;
+        let video_id = "abc123";
+        let wiki = dir.path().join("wiki/foo/abc123.md");
+        write_test_file(&wiki, b"wiki")?;
+        ledger.ensure_video(video_id, &canonical_video_url(video_id))?;
+        ledger.mark_wiki_emitted(video_id, &wiki)?;
+        ledger.conn.execute_batch(
+            r#"
+            CREATE TRIGGER fail_wiki_ingested
+            BEFORE UPDATE OF wiki_ingested_at ON videos
+            BEGIN
+                SELECT RAISE(FAIL, 'forced wiki_ingested_at failure');
+            END;
+            "#,
+        )?;
+        let config = WikiIngestConfig {
+            template: "true {path}".to_owned(),
+            uses_default_template: false,
+            cwd: dir.path().join("wiki"),
+            create_cwd_for_preflight: true,
+            timeout: Duration::from_secs(5),
+        };
+        let interrupts = Interrupts::inactive();
+
+        let err = run_wiki_ingest_batch(
+            dir.path(),
+            &ledger,
+            &config,
+            WikiIngestBatchOptions {
+                video_id: None,
+                retry_errors: false,
+                limit: None,
+                force: false,
+                missing_plugin_hint_emitted: None,
+            },
+            &interrupts,
+        )
+        .await
+        .expect_err("ledger update failure should fail the row");
+
+        assert!(format!("{err:#}").contains("every wiki ingestion failed"));
+        let row = ledger.row(video_id)?.expect("row exists");
+        assert!(row.wiki_ingested_at.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn core_stage_markers_preserve_wiki_ingest_errors_until_wiki_reemit() -> Result<()> {
+        let dir = tempdir()?;
+        let ledger = Ledger::open(dir.path())?;
+        let video_id = "abc123";
+        let wiki_error = "wiki-ingest exited 1: previous failure";
+        let audio_path = dir.path().join("media/abc123/audio.m4a");
+        let transcript_path = dir.path().join("transcripts/abc123/transcript.json");
+        let wiki_path = dir.path().join("wiki/channel/abc123.md");
+
+        ledger.ensure_video(video_id, &canonical_video_url(video_id))?;
+        ledger.mark_error(video_id, wiki_error)?;
+        ledger.mark_downloaded(video_id, &audio_path)?;
+        assert_eq!(
+            ledger.row(video_id)?.expect("row exists").error.as_deref(),
+            Some(wiki_error)
+        );
+
+        ledger.mark_transcribed(video_id, "large", &transcript_path)?;
+        assert_eq!(
+            ledger.row(video_id)?.expect("row exists").error.as_deref(),
+            Some(wiki_error)
+        );
+
+        ledger.mark_wiki_emitted(video_id, &wiki_path)?;
+        assert_eq!(
+            ledger.row(video_id)?.expect("row exists").error.as_deref(),
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn preserves_recorded_wiki_ingest_error_only_for_wiki_ingest_wrapper_error() -> Result<()> {
+        let ledger = Ledger::open_in_memory()?;
+        let video_id = "abc123";
+
+        ledger.ensure_video(video_id, &canonical_video_url(video_id))?;
+        ledger.mark_error(video_id, "wiki-ingest exited 1: stderr details")?;
+
+        assert!(should_preserve_recorded_wiki_ingest_error(
+            &ledger,
+            video_id,
+            "wiki-ingest abc123: every wiki ingestion failed (1 failure(s)): abc123"
+        ));
+        assert!(!should_preserve_recorded_wiki_ingest_error(
+            &ledger,
+            video_id,
+            "download audio for abc123: yt-dlp failed"
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn ledger_rejects_corrupt_tags_json() -> Result<()> {
         let ledger = Ledger::open_in_memory()?;
         ledger.conn.execute(
@@ -2871,12 +5404,262 @@ mod tests {
             limit: None,
             audio_format: "m4a".to_owned(),
             force: false,
+            auto_wiki_ingest: false,
+            wiki_ingest: default_wiki_ingest_args(),
         };
+        let interrupts = Interrupts::inactive();
 
-        process_video(&args, &ledger, video_id).await?;
+        process_video(&args, &ledger, video_id, None, None, &interrupts).await?;
 
         let row = ledger.row(video_id)?.expect("row exists");
         assert!(row.error.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn process_video_preserves_wiki_ingest_error_until_retry_succeeds() -> Result<()> {
+        let dir = tempdir()?;
+        let ledger = Ledger::open(dir.path())?;
+        let video_id = "dQw4w9WgXcQ";
+        let media_dir = dir.path().join("media").join(video_id);
+        let transcript_dir = dir.path().join("transcripts").join(video_id);
+        let wiki_path = dir
+            .path()
+            .join("wiki")
+            .join("rust-channel")
+            .join(format!("{video_id}.md"));
+        let info_path = media_dir.join("info.json");
+        let audio_path = media_dir.join("audio.m4a");
+        let transcript_json = transcript_dir.join("transcript.json");
+        let transcript_txt = transcript_dir.join("transcript.txt");
+        let wiki_error = "wiki-ingest exited 1: previous failure";
+
+        write_test_file(
+            &info_path,
+            br#"{
+                "id": "dQw4w9WgXcQ",
+                "webpage_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                "channel": "Rust Channel",
+                "title": "Skipped Success"
+            }"#,
+        )?;
+        write_test_file(&audio_path, b"audio")?;
+        write_test_file(&transcript_json, b"{}")?;
+        write_test_file(&transcript_txt, b"transcript")?;
+        write_test_file(&wiki_path, b"wiki")?;
+
+        ledger.ensure_video(video_id, &canonical_video_url(video_id))?;
+        ledger.mark_downloaded(video_id, &audio_path)?;
+        ledger.mark_transcribed(video_id, "large", &transcript_json)?;
+        ledger.mark_wiki_emitted(video_id, &wiki_path)?;
+        ledger.mark_error(video_id, wiki_error)?;
+
+        let args = IngestArgs {
+            url: canonical_video_url(video_id),
+            data_dir: dir.path().to_path_buf(),
+            whisper_model: "large".to_owned(),
+            whisper_bin: DEFAULT_WHISPER_BIN.to_owned(),
+            whisper_args: Vec::new(),
+            limit: None,
+            audio_format: "m4a".to_owned(),
+            force: false,
+            auto_wiki_ingest: false,
+            wiki_ingest: default_wiki_ingest_args(),
+        };
+        let interrupts = Interrupts::inactive();
+
+        process_video(&args, &ledger, video_id, None, None, &interrupts).await?;
+
+        let row = ledger.row(video_id)?.expect("row exists");
+        assert_eq!(row.error.as_deref(), Some(wiki_error));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn process_video_preserves_stale_error_until_failed_stage_is_recorded() -> Result<()> {
+        let dir = tempdir()?;
+        let ledger = Ledger::open(dir.path())?;
+        let video_id = "dQw4w9WgXcQ";
+        let info_path = dir.path().join("media").join(video_id).join("info.json");
+        std::fs::create_dir_all(&info_path)?;
+
+        ledger.ensure_video(video_id, &canonical_video_url(video_id))?;
+        ledger.mark_error(video_id, "old failure")?;
+
+        let args = IngestArgs {
+            url: canonical_video_url(video_id),
+            data_dir: dir.path().to_path_buf(),
+            whisper_model: "large".to_owned(),
+            whisper_bin: DEFAULT_WHISPER_BIN.to_owned(),
+            whisper_args: Vec::new(),
+            limit: None,
+            audio_format: "m4a".to_owned(),
+            force: false,
+            auto_wiki_ingest: false,
+            wiki_ingest: default_wiki_ingest_args(),
+        };
+        let interrupts = Interrupts::inactive();
+
+        let err = process_video(&args, &ledger, video_id, None, None, &interrupts)
+            .await
+            .expect_err("directory metadata path should fail before any stage records an error");
+        assert!(format!("{err:#}").contains("read existing"));
+        assert_eq!(
+            ledger.row(video_id)?.expect("row exists").error.as_deref(),
+            Some("old failure")
+        );
+
+        ledger.mark_error(video_id, &format!("{err:#}"))?;
+        assert_ne!(
+            ledger.row(video_id)?.expect("row exists").error.as_deref(),
+            Some("old failure")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn process_video_auto_wiki_ingests_after_emit() -> Result<()> {
+        let dir = tempdir()?;
+        let ledger = Ledger::open(dir.path())?;
+        let video_id = "dQw4w9WgXcQ";
+        let media_dir = dir.path().join("media").join(video_id);
+        let transcript_dir = dir.path().join("transcripts").join(video_id);
+        let info_path = media_dir.join("info.json");
+        let audio_path = media_dir.join("audio.m4a");
+        let transcript_json = transcript_dir.join("transcript.json");
+        let transcript_txt = transcript_dir.join("transcript.txt");
+        let counter = dir.path().join("auto-counter");
+
+        write_test_file(
+            &info_path,
+            br#"{
+                "id": "dQw4w9WgXcQ",
+                "webpage_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                "channel": "Rust Channel",
+                "title": "Auto Wiki"
+            }"#,
+        )?;
+        write_test_file(&audio_path, b"audio")?;
+        write_test_file(&transcript_json, b"{}")?;
+        write_test_file(&transcript_txt, b"transcript")?;
+
+        ledger.ensure_video(video_id, &canonical_video_url(video_id))?;
+        ledger.mark_downloaded(video_id, &audio_path)?;
+        ledger.mark_transcribed(video_id, "large", &transcript_json)?;
+
+        let template = format!(
+            "sh -c 'test -f \"$1\" && printf x >> \"$2\"' sh {{path}} {}",
+            shell_words::quote(&path_to_string(&counter))
+        );
+        let config = WikiIngestConfig {
+            template,
+            uses_default_template: false,
+            cwd: dir.path().join("wiki"),
+            create_cwd_for_preflight: true,
+            timeout: Duration::from_secs(5),
+        };
+        let args = IngestArgs {
+            url: canonical_video_url(video_id),
+            data_dir: dir.path().to_path_buf(),
+            whisper_model: "large".to_owned(),
+            whisper_bin: DEFAULT_WHISPER_BIN.to_owned(),
+            whisper_args: Vec::new(),
+            limit: None,
+            audio_format: "m4a".to_owned(),
+            force: false,
+            auto_wiki_ingest: true,
+            wiki_ingest: default_wiki_ingest_args(),
+        };
+        let interrupts = Interrupts::inactive();
+
+        let mut missing_plugin_hint_emitted = false;
+        process_video(
+            &args,
+            &ledger,
+            video_id,
+            Some(&config),
+            Some(&mut missing_plugin_hint_emitted),
+            &interrupts,
+        )
+        .await?;
+
+        let row = ledger.row(video_id)?.expect("row exists");
+        assert!(row.wiki_emitted_at.is_some());
+        assert!(row.wiki_ingested_at.is_some());
+        assert!(row.error.is_none());
+        assert_eq!(std::fs::read(&counter)?, b"x");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preflight_wiki_ingest_command_creates_default_cwd_after_command_is_found() -> Result<()>
+    {
+        let dir = tempdir()?;
+        let cwd = dir.path().join("wiki");
+        let program = path_to_string(&std::env::current_exe()?);
+
+        preflight_wiki_ingest_command(&program, &cwd, true, false).await?;
+
+        assert!(cwd.is_dir());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wiki_ingest_skips_preflight_when_no_work_is_pending() -> Result<()> {
+        // Empty data dir => no candidates => no preflight => no claude needed.
+        // This is the UX fix: standalone `wiki-ingest` on a fresh / fully-drained
+        // archive must succeed even without the default backend installed.
+        let dir = tempdir()?;
+        let missing_command = format!("missing-yta-command-{} {{path}}", std::process::id());
+        let args = WikiIngestCommandArgs {
+            data_dir: dir.path().to_path_buf(),
+            wiki_ingest: WikiIngestArgs {
+                wiki_ingest_cmd: Some(missing_command),
+                wiki_ingest_cwd: None,
+                wiki_ingest_timeout_secs: None,
+            },
+            video_id: None,
+            retry_errors: false,
+            limit: None,
+            force: false,
+        };
+        let interrupts = Interrupts::inactive();
+
+        wiki_ingest(args, &interrupts)
+            .await
+            .expect("empty wiki-ingest should succeed without preflighting the command");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preflight_wiki_ingest_command_uses_configured_cwd() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir()?;
+        let script = dir.path().join("ingest.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nif [ \"$#\" -ne 0 ]; then exit 64; fi\nexit 0\n",
+        )?;
+        let mut permissions = std::fs::metadata(&script)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions)?;
+
+        preflight_wiki_ingest_command("./ingest.sh", dir.path(), false, false).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preflight_wiki_ingest_command_rejects_missing_configured_cwd() -> Result<()> {
+        let dir = tempdir()?;
+        let missing = dir.path().join("missing-wiki-dir");
+
+        let err = preflight_wiki_ingest_command("sh", &missing, false, false)
+            .await
+            .expect_err("missing configured cwd should fail preflight");
+
+        assert!(format!("{err:#}").contains("wiki ingestion cwd does not exist"));
         Ok(())
     }
 
@@ -2892,6 +5675,23 @@ mod tests {
 
         let audio_path = row.audio_path.expect("audio path is set");
         assert_eq!(audio_path, "media/abc123/audio.m4a");
+        Ok(())
+    }
+
+    #[test]
+    fn ledger_path_normalization_handles_dot_segments() -> Result<()> {
+        let dir = tempdir()?;
+        let data_dir = dir.path().join(".").join("data");
+        let wiki = dir.path().join("data").join("wiki/foo/abc123.md");
+
+        assert_eq!(
+            path_to_ledger_string(&data_dir, &wiki)?,
+            "wiki/foo/abc123.md"
+        );
+        assert_eq!(
+            ledger_path_to_fs_path(&data_dir, "./wiki/../wiki/foo/abc123.md"),
+            wiki
+        );
         Ok(())
     }
 
@@ -2988,6 +5788,7 @@ mod tests {
         ledger.mark_transcribed(video_id, "large", &transcript_json)?;
         ledger.mark_wiki_emitted(video_id, &wiki)?;
         let before = ledger.row(video_id)?.expect("row exists");
+        let interrupts = Interrupts::inactive();
 
         let err = transcribe_audio(
             dir.path(),
@@ -3000,6 +5801,7 @@ mod tests {
                 extra_args: &[],
             },
             true,
+            &interrupts,
         )
         .await
         .expect_err("forced transcription should fail");
@@ -3067,6 +5869,7 @@ chmod 555 "$(dirname "$out")"
         ledger.mark_transcribed(video_id, "large", &transcript_json)?;
         ledger.mark_wiki_emitted(video_id, &wiki)?;
         let before = ledger.row(video_id)?.expect("row exists");
+        let interrupts = Interrupts::inactive();
 
         let whisper_bin = format!("sh {}", shell_words::quote(&path_to_string(&script)));
         let result = transcribe_audio(
@@ -3080,6 +5883,7 @@ chmod 555 "$(dirname "$out")"
                 extra_args: &[],
             },
             true,
+            &interrupts,
         )
         .await;
         let _ = std::fs::set_permissions(&transcript_dir, std::fs::Permissions::from_mode(0o755));
@@ -3308,36 +6112,36 @@ chmod 555 "$(dirname "$out")"
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn streamed_command_times_out_when_background_process_keeps_pipe_open() {
-        let args = vec!["-c".to_owned(), "sleep 2 & exit 0".to_owned()];
+    async fn run_checked_captures_stdout_and_stderr() -> Result<()> {
+        let args = vec!["-c".to_owned(), "printf out; printf err >&2".to_owned()];
+        let output = run_checked("sh", &args, &Interrupts::inactive()).await?;
 
-        let err = run_checked_stream_output("sh", &args)
-            .await
-            .expect_err("leaked stream pipe should time out");
-
-        assert!(format!("{err:#}").contains("timed out draining"));
+        assert_eq!(output.stdout, b"out");
+        assert_eq!(output.stderr, b"err");
+        Ok(())
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn streamed_command_times_out_silent_pipe_despite_other_pipe_progress() {
-        let script = concat!(
-            "(for i in 1 2 3 4 5 6 7 8 9 10; do ",
-            "printf tick >&2; sleep 0.05; ",
-            "done) >/dev/null & sleep 1 & exit 0",
-        );
-        let args = vec!["-c".to_owned(), script.to_owned()];
+    async fn streamed_command_stops_on_shared_interrupt() -> Result<()> {
+        let args = vec!["-c".to_owned(), "sleep 5".to_owned()];
+        let (interrupts, sender) = Interrupts::test_channel();
+        let trigger = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = sender.send(true);
+        });
 
-        let result = tokio::time::timeout(
-            STREAM_READER_DRAIN_TIMEOUT * 3,
-            run_checked_stream_output("sh", &args),
+        let err = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_checked_stream_output("sh", &args, &interrupts),
         )
-        .await;
-        let err = result
-            .expect("stdout drain timeout should not be masked by stderr progress")
-            .expect_err("leaked stdout pipe should time out");
+        .await
+        .expect("shared interrupt should stop the command promptly")
+        .expect_err("interrupted command should fail");
+        trigger.await.context("join interrupt trigger")?;
 
-        assert!(format!("{err:#}").contains("timed out draining stdout"));
+        assert!(is_interrupted_error(&err));
+        Ok(())
     }
 
     #[tokio::test]
@@ -3355,6 +6159,30 @@ chmod 555 "$(dirname "$out")"
         let output = join_stream_reader(task, "stdout", "test command", &progress).await?;
 
         assert_eq!(output, b"done");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wiki_ingest_rejects_timeout_too_large_for_deadline() -> Result<()> {
+        let dir = tempdir()?;
+        let command = RenderedWikiIngestCommand {
+            rendered: "sh -c true".to_owned(),
+            program: "sh".to_owned(),
+            args: vec!["-c".to_owned(), "true".to_owned()],
+        };
+        let interrupts = Interrupts::inactive();
+
+        let err = run_wiki_ingest_command(
+            &command,
+            dir.path(),
+            Duration::from_secs(u64::MAX),
+            &interrupts,
+        )
+        .await
+        .expect_err("unrepresentable timeout should be rejected without panicking");
+
+        assert!(format!("{err:#}").contains("timeout is too large"));
         Ok(())
     }
 
@@ -3440,20 +6268,35 @@ chmod 555 "$(dirname "$out")"
         let ledger = Ledger::open(dir.path())?;
         let complete_id = "dQw4w9WgXcQ";
         let failed_id = "abc1234567_";
+        let core_error_id = "def1234567_";
         let complete_audio = dir.path().join("media/dQw4w9WgXcQ/audio.m4a");
         let complete_transcript_json = dir.path().join("transcripts/dQw4w9WgXcQ/transcript.json");
         let complete_transcript_txt = dir.path().join("transcripts/dQw4w9WgXcQ/transcript.txt");
         let complete_wiki = dir.path().join("wiki/channel/dQw4w9WgXcQ.md");
+        let core_error_audio = dir.path().join("media/def1234567_/audio.m4a");
+        let core_error_transcript_json = dir.path().join("transcripts/def1234567_/transcript.json");
+        let core_error_transcript_txt = dir.path().join("transcripts/def1234567_/transcript.txt");
+        let core_error_wiki = dir.path().join("wiki/channel/def1234567_.md");
 
         write_test_file(&complete_audio, b"audio")?;
         write_test_file(&complete_transcript_json, b"{}")?;
         write_test_file(&complete_transcript_txt, b"transcript")?;
         write_test_file(&complete_wiki, b"wiki")?;
+        write_test_file(&core_error_audio, b"audio")?;
+        write_test_file(&core_error_transcript_json, b"{}")?;
+        write_test_file(&core_error_transcript_txt, b"transcript")?;
+        write_test_file(&core_error_wiki, b"wiki")?;
 
         ledger.ensure_video(complete_id, &canonical_video_url(complete_id))?;
         ledger.mark_downloaded(complete_id, &complete_audio)?;
         ledger.mark_transcribed(complete_id, "large", &complete_transcript_json)?;
         ledger.mark_wiki_emitted(complete_id, &complete_wiki)?;
+        ledger.mark_error(complete_id, "wiki-ingest exited 1: missing plugin")?;
+        ledger.ensure_video(core_error_id, &canonical_video_url(core_error_id))?;
+        ledger.mark_downloaded(core_error_id, &core_error_audio)?;
+        ledger.mark_transcribed(core_error_id, "large", &core_error_transcript_json)?;
+        ledger.mark_wiki_emitted(core_error_id, &core_error_wiki)?;
+        ledger.mark_error(core_error_id, "download failed")?;
         ledger.ensure_video(failed_id, &canonical_video_url(failed_id))?;
         ledger.mark_error(failed_id, "download failed")?;
         drop(ledger);
@@ -3462,6 +6305,12 @@ chmod 555 "$(dirname "$out")"
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].video_id, complete_id);
+        assert!(
+            rows[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| is_wiki_ingest_ledger_error(Some(error)))
+        );
         Ok(())
     }
 
@@ -3560,6 +6409,465 @@ chmod 555 "$(dirname "$out")"
         assert!(should_skip_wiki(dir.path(), &row, false));
         assert!(!should_skip_wiki(dir.path(), &row, true));
 
+        assert!(!should_skip_wiki_ingest(dir.path(), &row, false));
+        ledger.mark_wiki_ingested(&row, "claude -p /wiki:ingest")?;
+        row = ledger.row(video_id)?.expect("row exists");
+        assert!(should_skip_wiki_ingest(dir.path(), &row, false));
+        assert!(!should_skip_wiki_ingest(dir.path(), &row, true));
+        std::fs::remove_file(&wiki)?;
+        assert!(!should_skip_wiki_ingest(dir.path(), &row, false));
+
+        let wiki_dir = dir.path().join("wiki-ingest-dir.md");
+        std::fs::create_dir(&wiki_dir)?;
+        ledger.mark_wiki_emitted(video_id, &wiki_dir)?;
+        row = ledger.row(video_id)?.expect("row exists");
+        ledger.mark_wiki_ingested(&row, "claude -p /wiki:ingest")?;
+        row = ledger.row(video_id)?.expect("row exists");
+        assert!(!should_skip_wiki_ingest(dir.path(), &row, false));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wiki_ingest_engine_records_success_skip_force_and_failure() -> Result<()> {
+        let dir = tempdir()?;
+        let data_dir = dir.path().join("data dir");
+        let ledger = Ledger::open(&data_dir)?;
+        let video_id = "abc123";
+        let wiki = data_dir.join("wiki").join("foo").join("abc123.md");
+        let counter = dir.path().join("counter");
+        write_test_file(&wiki, b"wiki")?;
+        ledger.upsert_metadata(&VideoMetadata {
+            video_id: video_id.to_owned(),
+            url: canonical_video_url(video_id),
+            channel_id: None,
+            channel_title: Some("Foo".to_owned()),
+            uploader: None,
+            title: Some("A Title".to_owned()),
+            upload_date: None,
+            duration: None,
+            tags: Vec::new(),
+        })?;
+        ledger.mark_wiki_emitted(video_id, &wiki)?;
+
+        let template = format!(
+            "sh -c 'test -f \"$1\" && printf x >> \"$2\"' sh {{path}} {}",
+            shell_words::quote(&path_to_string(&counter))
+        );
+        let config = WikiIngestConfig {
+            template,
+            uses_default_template: false,
+            cwd: dir.path().join("wiki"),
+            create_cwd_for_preflight: true,
+            timeout: Duration::from_secs(5),
+        };
+        let interrupts = Interrupts::inactive();
+
+        let outcome = run_wiki_ingest_batch(
+            &data_dir,
+            &ledger,
+            &config,
+            WikiIngestBatchOptions {
+                video_id: None,
+                retry_errors: false,
+                limit: None,
+                force: false,
+                missing_plugin_hint_emitted: None,
+            },
+            &interrupts,
+        )
+        .await?;
+        assert_eq!(outcome.succeeded, 1);
+        assert_eq!(std::fs::read(&counter)?, b"x");
+        let first = ledger.row(video_id)?.expect("row exists");
+        let first_ingested_at = first.wiki_ingested_at.clone();
+        assert!(first_ingested_at.is_some());
+        assert!(first.wiki_ingest_cmd.as_deref().is_some_and(|cmd| {
+            cmd.contains("test -f")
+                && cmd.contains(&path_to_string(&absolutize_path(&wiki).unwrap()))
+        }));
+
+        let outcome = run_wiki_ingest_batch(
+            &data_dir,
+            &ledger,
+            &config,
+            WikiIngestBatchOptions {
+                video_id: None,
+                retry_errors: false,
+                limit: None,
+                force: false,
+                missing_plugin_hint_emitted: None,
+            },
+            &interrupts,
+        )
+        .await?;
+        assert_eq!(outcome.succeeded + outcome.skipped + outcome.failed, 0);
+        assert_eq!(std::fs::read(&counter)?, b"x");
+        assert_eq!(
+            ledger.row(video_id)?.expect("row exists").wiki_ingested_at,
+            first_ingested_at
+        );
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let outcome = run_wiki_ingest_batch(
+            &data_dir,
+            &ledger,
+            &config,
+            WikiIngestBatchOptions {
+                video_id: None,
+                retry_errors: false,
+                limit: None,
+                force: true,
+                missing_plugin_hint_emitted: None,
+            },
+            &interrupts,
+        )
+        .await?;
+        assert_eq!(outcome.succeeded, 1);
+        assert_eq!(std::fs::read(&counter)?, b"xx");
+        let forced = ledger.row(video_id)?.expect("row exists");
+        assert_ne!(forced.wiki_ingested_at, first_ingested_at);
+
+        let failing = WikiIngestConfig {
+            template: "false {path}".to_owned(),
+            uses_default_template: false,
+            cwd: dir.path().join("wiki"),
+            create_cwd_for_preflight: true,
+            timeout: Duration::from_secs(5),
+        };
+        let err = run_wiki_ingest_batch(
+            &data_dir,
+            &ledger,
+            &failing,
+            WikiIngestBatchOptions {
+                video_id: None,
+                retry_errors: true,
+                limit: None,
+                force: true,
+                missing_plugin_hint_emitted: None,
+            },
+            &interrupts,
+        )
+        .await
+        .expect_err("failing command should fail the batch");
+
+        assert!(format!("{err:#}").contains("every wiki ingestion failed"));
+        let failed = ledger.row(video_id)?.expect("row exists");
+        assert!(
+            failed
+                .error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("wiki-ingest exited 1:"))
+        );
+        assert_eq!(std::fs::read(&wiki)?, b"wiki");
+
+        let outcome = run_wiki_ingest_batch(
+            &data_dir,
+            &ledger,
+            &config,
+            WikiIngestBatchOptions {
+                video_id: None,
+                retry_errors: true,
+                limit: None,
+                force: false,
+                missing_plugin_hint_emitted: None,
+            },
+            &interrupts,
+        )
+        .await?;
+        assert_eq!(outcome.succeeded, 1);
+        assert_eq!(std::fs::read(&counter)?, b"xxx");
+        let retried = ledger.row(video_id)?.expect("row exists");
+        assert!(retried.error.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wiki_ingest_batch_returns_ok_when_some_attempts_succeed() -> Result<()> {
+        let dir = tempdir()?;
+        let ledger = Ledger::open(dir.path())?;
+        let script = dir.path().join("ingest.sh");
+        write_test_file(
+            &script,
+            br#"test -f "$2" || exit 9
+if [ "$1" = "good123" ]; then
+  exit 0
+fi
+echo "planned failure" >&2
+exit 7
+"#,
+        )?;
+
+        for video_id in ["bad456", "good123"] {
+            let wiki = dir
+                .path()
+                .join("wiki")
+                .join("foo")
+                .join(format!("{video_id}.md"));
+            write_test_file(&wiki, b"wiki")?;
+            ledger.ensure_video(video_id, &canonical_video_url(video_id))?;
+            ledger.mark_wiki_emitted(video_id, &wiki)?;
+        }
+
+        let config = WikiIngestConfig {
+            template: format!(
+                "sh {} {{video_id}} {{path}}",
+                shell_words::quote(&path_to_string(&script))
+            ),
+            uses_default_template: false,
+            cwd: dir.path().join("wiki"),
+            create_cwd_for_preflight: true,
+            timeout: Duration::from_secs(5),
+        };
+        let interrupts = Interrupts::inactive();
+
+        let outcome = run_wiki_ingest_batch(
+            dir.path(),
+            &ledger,
+            &config,
+            WikiIngestBatchOptions {
+                video_id: None,
+                retry_errors: false,
+                limit: None,
+                force: false,
+                missing_plugin_hint_emitted: None,
+            },
+            &interrupts,
+        )
+        .await?;
+
+        assert_eq!(outcome.succeeded, 1);
+        assert_eq!(outcome.failed, 1);
+        assert!(
+            ledger
+                .row("good123")?
+                .expect("row exists")
+                .wiki_ingested_at
+                .is_some()
+        );
+        assert!(
+            ledger
+                .row("bad456")?
+                .expect("row exists")
+                .error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("wiki-ingest exited 7:"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wiki_ingest_batch_records_bad_first_row_without_aborting_preflight() -> Result<()> {
+        let dir = tempdir()?;
+        let ledger = Ledger::open(dir.path())?;
+        let good_wiki = dir.path().join("wiki/foo/good123.md");
+        write_test_file(&good_wiki, b"wiki")?;
+
+        ledger.ensure_video("bad456", &canonical_video_url("bad456"))?;
+        ledger.conn.execute(
+            "UPDATE videos SET wiki_emitted_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE video_id = ?1",
+            params!["bad456"],
+        )?;
+        ledger.ensure_video("good123", &canonical_video_url("good123"))?;
+        ledger.mark_wiki_emitted("good123", &good_wiki)?;
+
+        let config = WikiIngestConfig {
+            template: "true {path}".to_owned(),
+            uses_default_template: false,
+            cwd: dir.path().join("wiki"),
+            create_cwd_for_preflight: true,
+            timeout: Duration::from_secs(5),
+        };
+        let interrupts = Interrupts::inactive();
+
+        let outcome = run_wiki_ingest_batch(
+            dir.path(),
+            &ledger,
+            &config,
+            WikiIngestBatchOptions {
+                video_id: None,
+                retry_errors: false,
+                limit: None,
+                force: false,
+                missing_plugin_hint_emitted: None,
+            },
+            &interrupts,
+        )
+        .await?;
+
+        assert_eq!(outcome.succeeded, 1);
+        assert_eq!(outcome.failed, 1);
+        assert!(
+            ledger
+                .row("bad456")?
+                .expect("row exists")
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("has no wiki_path"))
+        );
+        assert!(
+            ledger
+                .row("good123")?
+                .expect("row exists")
+                .wiki_ingested_at
+                .is_some()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refreshed_wiki_ingest_rows_must_still_be_pending_candidates() -> Result<()> {
+        let dir = tempdir()?;
+        let wiki = dir.path().join("wiki/foo/abc123.md");
+        write_test_file(&wiki, b"wiki")?;
+        let mut row = row_for_skip_tests();
+        row.wiki_path = Some(path_to_ledger_string(dir.path(), &wiki)?);
+
+        row.wiki_emitted_at = None;
+        assert!(!should_attempt_wiki_ingest_row(dir.path(), &row, false, false).await);
+
+        row.wiki_emitted_at = Some("2026-05-19T00:00:00Z".to_owned());
+        assert!(should_attempt_wiki_ingest_row(dir.path(), &row, false, false).await);
+
+        row.wiki_ingested_at = Some("2026-05-19T00:00:01Z".to_owned());
+        assert!(!should_attempt_wiki_ingest_row(dir.path(), &row, false, false).await);
+        assert!(should_attempt_wiki_ingest_row(dir.path(), &row, false, true).await);
+
+        std::fs::remove_file(&wiki)?;
+        assert!(should_attempt_wiki_ingest_row(dir.path(), &row, false, false).await);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wiki_ingest_candidates_reject_unknown_or_not_emitted_video_id() -> Result<()> {
+        let dir = tempdir()?;
+        let ledger = Ledger::open_in_memory()?;
+
+        let err =
+            wiki_ingest_candidate_rows(dir.path(), &ledger, Some("missing"), false, false, None)
+                .await
+                .expect_err("unknown video id should fail");
+        assert!(format!("{err:#}").contains("not in the ledger"));
+
+        ledger.ensure_video("abc123", &canonical_video_url("abc123"))?;
+        let err =
+            wiki_ingest_candidate_rows(dir.path(), &ledger, Some("abc123"), false, false, None)
+                .await
+                .expect_err("video without wiki article should fail");
+        assert!(format!("{err:#}").contains("no emitted wiki article"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wiki_ingest_candidates_skip_already_ingested_rows_until_force() -> Result<()> {
+        let dir = tempdir()?;
+        let ledger = Ledger::open_in_memory()?;
+        let video_id = "abc123";
+        let wiki = dir.path().join("wiki/foo/abc123.md");
+        write_test_file(&wiki, b"wiki")?;
+
+        ledger.ensure_video(video_id, &canonical_video_url(video_id))?;
+        ledger.mark_wiki_emitted(video_id, &wiki)?;
+        let row = ledger.row(video_id)?.expect("row exists");
+        ledger.mark_wiki_ingested(&row, "claude -p /wiki:ingest")?;
+
+        let rows =
+            wiki_ingest_candidate_rows(dir.path(), &ledger, None, false, false, None).await?;
+        assert!(rows.is_empty());
+
+        std::fs::remove_file(&wiki)?;
+        let rows =
+            wiki_ingest_candidate_rows(dir.path(), &ledger, None, false, false, None).await?;
+        assert!(rows.is_empty());
+
+        std::fs::create_dir_all(&wiki)?;
+        let rows =
+            wiki_ingest_candidate_rows(dir.path(), &ledger, None, false, false, None).await?;
+        assert!(rows.is_empty());
+
+        let rows = wiki_ingest_candidate_rows(dir.path(), &ledger, None, false, true, None).await?;
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.video_id.as_str())
+                .collect::<Vec<_>>(),
+            ["abc123"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wiki_ingest_candidates_filter_recorded_errors_without_retry() -> Result<()> {
+        let dir = tempdir()?;
+        let ledger = Ledger::open_in_memory()?;
+        let unrelated_id = "abc123";
+        let wiki_error_id = "def456";
+        let clean_id = "ghi789";
+
+        ledger.ensure_video(unrelated_id, &canonical_video_url(unrelated_id))?;
+        ledger.mark_wiki_emitted(unrelated_id, &dir.path().join("wiki/foo/abc123.md"))?;
+        ledger.mark_error(unrelated_id, "download failed")?;
+
+        ledger.ensure_video(wiki_error_id, &canonical_video_url(wiki_error_id))?;
+        ledger.mark_wiki_emitted(wiki_error_id, &dir.path().join("wiki/foo/def456.md"))?;
+        ledger.mark_error(wiki_error_id, "wiki-ingest exited 1: missing plugin")?;
+
+        ledger.ensure_video(clean_id, &canonical_video_url(clean_id))?;
+        ledger.mark_wiki_emitted(clean_id, &dir.path().join("wiki/foo/ghi789.md"))?;
+
+        let rows =
+            wiki_ingest_candidate_rows(dir.path(), &ledger, None, false, false, None).await?;
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.video_id.as_str())
+                .collect::<Vec<_>>(),
+            ["ghi789"]
+        );
+
+        // retry_errors=true must only resurface rows whose existing
+        // error came from the wiki-ingest stage itself — an unrelated
+        // "download failed" error must NOT trigger a paid LLM call.
+        let rows = wiki_ingest_candidate_rows(dir.path(), &ledger, None, true, false, None).await?;
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.video_id.as_str())
+                .collect::<Vec<_>>(),
+            ["def456", "ghi789"]
+        );
+
+        // force=true bypasses error filtering entirely.
+        let rows = wiki_ingest_candidate_rows(dir.path(), &ledger, None, false, true, None).await?;
+        assert_eq!(rows.len(), 3);
+
+        let rows =
+            wiki_ingest_candidate_rows(dir.path(), &ledger, None, true, true, Some(1)).await?;
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.video_id.as_str())
+                .collect::<Vec<_>>(),
+            ["abc123"]
+        );
+
+        let err = wiki_ingest_candidate_rows(
+            dir.path(),
+            &ledger,
+            Some(wiki_error_id),
+            false,
+            false,
+            None,
+        )
+        .await
+        .expect_err("explicit errored video should explain retry requirement");
+        assert!(format!("{err:#}").contains("pass --retry-errors"));
+
+        let rows =
+            wiki_ingest_candidate_rows(dir.path(), &ledger, Some(wiki_error_id), false, true, None)
+                .await?;
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.video_id.as_str())
+                .collect::<Vec<_>>(),
+            ["def456"]
+        );
         Ok(())
     }
 }

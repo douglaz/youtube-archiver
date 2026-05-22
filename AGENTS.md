@@ -30,13 +30,31 @@ Keep it short and concrete.
 youtube-archiver ingest <URL> [--data-dir DIR] [--whisper-model MODEL]
                               [--whisper-bin CMD] [--limit N]
                               [--audio-format FMT] [--force]
+                              [--auto-wiki-ingest]
+                              [--wiki-ingest-cmd TEMPLATE]
+                              [--wiki-ingest-cwd DIR]
+                              [--wiki-ingest-timeout-secs N]
+youtube-archiver wiki-ingest [--data-dir DIR] [--wiki-ingest-cmd TEMPLATE]
+                             [--wiki-ingest-cwd DIR]
+                             [--wiki-ingest-timeout-secs N]
+                             [--video-id ID] [--retry-errors] [--limit N]
+                             [--force]
 youtube-archiver status [--data-dir DIR]   # prints per-video state table
 youtube-archiver list   [--data-dir DIR]   # lists archived videos as JSON
 ```
 
-`ingest` is the only command that does work; `status`/`list` are read-only.
+`ingest` and `wiki-ingest` are the commands that do work; `status`/`list` are read-only.
 `--force` re-runs every step even if outputs exist (useful for changing
 whisper models).
+
+## Runtime requirements
+
+Automatic llm-wiki ingestion needs `claude` plus the `wiki@llm-wiki` plugin,
+or a custom command passed with `--wiki-ingest-cmd` (or
+`YTARCH_WIKI_INGEST_CMD`).
+The default ingestion command runs Claude Code with `--permission-mode
+acceptEdits` and allows `Bash,Read,Write,Edit,Glob,Grep,Task`; override it if
+that is too broad for the environment.
 
 ## On-disk layout
 
@@ -60,8 +78,9 @@ video_id, tags) followed by the transcript body.
 ## State ledger (`state.sqlite`)
 
 One table, columns roughly: `video_id PK, url, channel_id, channel_title,
-title, downloaded_at, transcribed_at, wiki_emitted_at, whisper_model,
-audio_path, transcript_path, wiki_path, error`.
+uploader, title, upload_date, duration, tags, downloaded_at, transcribed_at,
+wiki_emitted_at, wiki_ingested_at, wiki_ingest_cmd, whisper_model, audio_path,
+transcript_path, wiki_path, error`.
 
 `error` is nullable text. A row exists per video as soon as we know about
 it; timestamps fill in as stages complete. Skip-if-already-done logic
@@ -82,16 +101,28 @@ before short-circuiting.
    d. **Emit wiki article**: render markdown with frontmatter into
       `wiki/<channel_slug>/<id>.md`. Skip if file present unless
       `--force`.
+   e. **Optional llm-wiki ingestion**: with `--auto-wiki-ingest`, invoke
+      the configured wiki ingestion command after the article is emitted.
 3. Update ledger after each stage; never leave half-written files
    (write to temp + rename).
 
-Stages b/c/d must be resumable independently — if whisper crashes
+Stages b/c/d/e must be resumable independently — if whisper crashes
 midway, the next run finishes from there.
+
+## Automatic ingestion
+
+Happy path:
+
+```bash
+claude plugin install wiki@llm-wiki
+youtube-archiver ingest --auto-wiki-ingest <URL>
+```
 
 ## Error handling
 
 - Per-video errors get logged to the ledger's `error` column and do not
-  abort the batch. The CLI exits non-zero only if every video failed.
+  abort the batch. `ingest` and `wiki-ingest` exit non-zero only if every
+  attempted video failed.
 - External commands invoked via `tokio::process::Command`; capture
   stderr on failure and surface it in the error message.
 
@@ -117,8 +148,6 @@ needs it.
   enhancement, but transcripts via whisper are the primary path because
   the user wants the same whisper invocation they're already using for
   audio notes.
-- Calling `/wiki:ingest` automatically. We just produce the files; the
-  user runs the slash command themselves.
 - A daemon / watch mode.
 
 ## Nix

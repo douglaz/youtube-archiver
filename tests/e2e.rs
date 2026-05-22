@@ -76,7 +76,10 @@ fn list_stdout_stays_json_when_ledger_warns() -> Result<(), Box<dyn Error>> {
 }
 
 fn create_ledger_with_bad_tags(data_dir: &Path) -> Result<(), Box<dyn Error>> {
-    std::fs::create_dir_all(data_dir)?;
+    // Materialise the schema directly so this regression test only
+    // depends on `list`'s tolerance for corrupt rows, not on
+    // `wiki-ingest`'s preflight, lock, or template parser. Keep these
+    // columns in sync with `Ledger::init` in src/main.rs.
     let conn = Connection::open(data_dir.join("state.sqlite"))?;
     conn.execute_batch(
         r#"
@@ -93,6 +96,8 @@ fn create_ledger_with_bad_tags(data_dir: &Path) -> Result<(), Box<dyn Error>> {
             downloaded_at TEXT,
             transcribed_at TEXT,
             wiki_emitted_at TEXT,
+            wiki_ingested_at TEXT,
+            wiki_ingest_cmd TEXT,
             whisper_model TEXT,
             audio_path TEXT,
             transcript_path TEXT,
