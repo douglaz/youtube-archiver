@@ -60,7 +60,7 @@ jobs:
         done
 
     - name: Upload artifacts
-      uses: actions/upload-artifact@v6
+      uses: actions/upload-artifact@v7
       with:
         name: youtube-archiver-linux-binaries
         path: artifacts/*.tar.gz
@@ -119,7 +119,7 @@ jobs:
         done
 
     - name: Upload artifacts
-      uses: actions/upload-artifact@v6
+      uses: actions/upload-artifact@v7
       with:
         name: youtube-archiver-macos-binaries
         path: artifacts/*.tar.gz
